@@ -1,0 +1,2007 @@
+/* ============================================================================
+ * 手机银行 App 前端(渠道 app)
+ *
+ * ★ 这个文件里**没有一行业务判断**。
+ *   它只做三件事:把用户的话发给网关、把网关的回复渲染出来、把用户的结构化动作回传。
+ *   哪句话该被拦、要不要人脸、能不能挂失 —— 全部由服务端的策略引擎决定。
+ *
+ *   这条边界很重要:如果前端自己判断"这句话像是挂失,我直接显示已冻结",
+ *   那就等于在客户端复制了一套业务逻辑 —— 两套逻辑迟早会不一致,
+ *   而用户会在 App 上看到"已冻结"、在人工坐席那里听到"其实没冻"。
+ * ========================================================================== */
+
+const CHANNEL = "app";
+
+// ---- 会话:同一次连续对话共用一个 sessionId(服务端按会话维护上下文) ----
+const SESSION_KEY = "bank-agent-session";
+const sessionId = (() => {
+  const existing = sessionStorage.getItem(SESSION_KEY);
+  if (existing) return existing;
+  const fresh = `web_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  sessionStorage.setItem(SESSION_KEY, fresh);
+  return fresh;
+})();
+
+// ---- DOM ----
+const $ = (id) => document.getElementById(id);
+const messagesEl = $("messages");
+const paneChat = $("pane-chat");
+const paneAudit = $("pane-audit");
+const paneHistory = $("pane-history");
+const historyBody = $("history-body");
+const auditBody = $("audit-body");
+const composer = $("composer");
+const inputEl = $("input");
+const formEl = $("form");
+const sendBtn = $("send");
+const btnBack = $("btn-back");
+const btnAudit = $("btn-audit");
+const btnHistory = $("btn-history");
+const btnMenu = $("btn-menu");
+const appbarSub = $("appbar-sub");
+const drawerMask = $("drawer-mask");
+const drawerBody = $("drawer-body");
+const drawerName = $("drawer-name");
+const drawerSub = $("drawer-sub");
+const btnDrawerClose = $("btn-drawer-close");
+
+let busy = false;
+let profile = null;
+/** 当前等待用户处理的动作(确认 / 强验证),来自最近一次回复 */
+let pending = null;
+
+// ============================================================================
+// 网关调用
+// ============================================================================
+
+async function post(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok || data.ok === false) throw new Error(data.error ?? `请求失败(${res.status})`);
+  return data;
+}
+
+async function get(path) {
+  const res = await fetch(path);
+  const data = await res.json();
+  if (!res.ok || data.ok === false) throw new Error(data.error ?? `请求失败(${res.status})`);
+  return data;
+}
+
+const sendText = (text) =>
+  post(`/api/channels/${CHANNEL}/messages`, { text, sessionId }).then((d) => d.turn);
+
+const sendAction = (action) =>
+  post(`/api/channels/${CHANNEL}/actions`, { sessionId, action }).then((d) => d.turn);
+
+// ============================================================================
+// 时间
+// ============================================================================
+
+function tickClock() {
+  const d = new Date();
+  const el = $("clock");
+  if (el) el.textContent = `${d.getHours()}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+tickClock();
+setInterval(tickClock, 20000);
+
+// ============================================================================
+// 左侧抽屉:常用服务 / 我的卡片 / 账户概览
+//
+// ★ 抽屉只是这些入口的"容器",里面的每一项仍然只是发一句话给网关 ——
+//   与对话里的按钮完全同一条路,前端不做任何业务判断。
+//   遮罩点击 / 关闭按钮 / Esc 都能收起;在抽屉里点了任何入口,先收起再办。
+// ============================================================================
+
+function openDrawer() {
+  drawerMask.hidden = false;
+}
+
+function closeDrawer() {
+  drawerMask.hidden = true;
+  if (!paneChat.hidden) inputEl.focus();
+}
+
+btnMenu.addEventListener("click", openDrawer);
+btnDrawerClose.addEventListener("click", closeDrawer);
+drawerMask.addEventListener("click", (e) => {
+  if (e.target === drawerMask) closeDrawer();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !drawerMask.hidden) closeDrawer();
+});
+// 抽屉里点任何可操作的入口(按钮 / 小卡片),先把抽屉收起来
+drawerBody.addEventListener("click", (e) => {
+  if (e.target.closest("button, .mini-card")) closeDrawer();
+});
+
+// ============================================================================
+// 渲染:文本
+// ============================================================================
+
+/**
+ * 把 Agent 的纯文本回复渲染成安全的 DOM。
+ *
+ * ★ 刻意不用 innerHTML 拼字符串:回复里会包含用户自己说过的话
+ *   (比如收款人姓名、备注),而备注是本项目明确的**注入载体**。
+ *   在这里用 innerHTML,等于把服务端辛苦做的注入防御在展示层又开了一个口子。
+ *   全部走 textContent,只对 `**加粗**` 与 `★` 做一次极小的白名单标记。
+ */
+function renderText(raw) {
+  const frag = document.createDocumentFragment();
+  const lines = String(raw ?? "").split("\n");
+
+  lines.forEach((line, i) => {
+    if (i > 0) frag.appendChild(document.createTextNode("\n"));
+    // 只认 **...** 这一种标记,不解析任何 HTML
+    const parts = line.split(/(\*\*[^*]+\*\*)/g);
+    for (const part of parts) {
+      if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+        const b = document.createElement("span");
+        b.className = "md-strong";
+        b.textContent = part.slice(2, -2);
+        frag.appendChild(b);
+      } else if (part) {
+        frag.appendChild(document.createTextNode(part));
+      }
+    }
+  });
+
+  return frag;
+}
+
+function addMessage({ role, text, variant, stack }) {
+  const wrap = document.createElement("div");
+  wrap.className = `msg ${role}`;
+
+  const avatar = document.createElement("div");
+  avatar.className = "avatar";
+  const icon = document.createElement("i");
+  icon.className = role === "user" ? "ri-user-3-line" : "ri-robot-2-line";
+  icon.setAttribute("aria-hidden", "true");
+  avatar.appendChild(icon);
+  wrap.appendChild(avatar);
+
+  if (stack) {
+    wrap.appendChild(stack);
+  } else {
+    const bubble = document.createElement("div");
+    bubble.className = `bubble${variant ? ` ${variant}` : ""}`;
+    bubble.appendChild(renderText(text));
+    wrap.appendChild(bubble);
+  }
+
+  messagesEl.appendChild(wrap);
+  scrollToEnd();
+  return wrap;
+}
+
+function renderCard(card) {
+  if (!card) return null;
+  const box = document.createElement("div");
+  box.className = "ui-card";
+
+  const head = document.createElement("div");
+  head.className = "ui-card-head";
+  head.innerHTML = '<i class="ri-file-list-3-line" aria-hidden="true"></i>';
+  head.appendChild(document.createTextNode(card.title ?? "请确认"));
+  box.appendChild(head);
+
+  const body = document.createElement("div");
+  body.className = "ui-card-body";
+  for (const f of card.fields ?? []) {
+    const row = document.createElement("div");
+    row.className = `ui-row${f.emphasis ? " emph" : ""}`;
+    const label = document.createElement("div");
+    label.className = "ui-row-label";
+    label.textContent = f.label;
+    const value = document.createElement("div");
+    value.className = "ui-row-value";
+    value.textContent = f.value;
+    row.append(label, value);
+    body.appendChild(row);
+  }
+  box.appendChild(body);
+
+  if (card.warning) {
+    const w = document.createElement("div");
+    w.className = "ui-card-warn";
+    w.appendChild(renderText(card.warning));
+    box.appendChild(w);
+  }
+  if (card.reversibility) {
+    const r = document.createElement("div");
+    r.className = "ui-card-rev";
+    r.textContent = `可撤销:${card.reversibility}`;
+    box.appendChild(r);
+  }
+  return box;
+}
+
+function renderPolicy(summary) {
+  const items = (summary ?? []).filter((r) => r.effect === "deny" || r.effect === "escalate");
+  if (items.length === 0) return null;
+
+  const details = document.createElement("details");
+  details.className = "policy";
+  const summaryEl = document.createElement("summary");
+  summaryEl.textContent = `策略裁决明细(${items.length} 条 · 纯确定性规则,无 LLM 参与)`;
+  details.appendChild(summaryEl);
+
+  const list = document.createElement("div");
+  list.className = "policy-list";
+  for (const r of items) {
+    const item = document.createElement("div");
+    item.className = `policy-item ${r.effect ?? ""}`;
+    const rid = document.createElement("span");
+    rid.className = "rid";
+    rid.textContent = `[${r.ruleId}] `;
+    item.append(rid, document.createTextNode(r.message ?? ""));
+    list.appendChild(item);
+  }
+  details.appendChild(list);
+  return details;
+}
+
+// ============================================================================
+// 渲染:办理流程(可视化步骤链路)
+//
+// ★ 这一块**只负责画**。每一步归谁办(Agent 自主 / 等你确认 / 需你验证 /
+//   已转人工审批 / 已被拦截)由服务端在 flow.steps[].lane 上给出;
+//   前端不做任何"这句话像不像转账""该不该拦"的判断 ——
+//   否则界面与后端迟早会各说各话,而那是这类产品最难查的一类故障。
+// ============================================================================
+
+/** 步骤归属 → 人话(服务端给 lane,前端只做翻译,不做判断) */
+const LANE_TEXT = {
+  auto: "Agent 自主执行",
+  customer: "等您确认",
+  customer_auth: "需您本人验证",
+  human_review: "已转人工审批",
+  blocked: "已被拦截",
+};
+
+const STEP_ICON = [
+  [/收到您的请求/, "ri-inbox-archive-line"],
+  [/理解为您的意图/, "ri-question-answer-line"],
+  [/拆成|执行计划/, "ri-node-tree"],
+  [/策略校验/, "ri-shield-check-line"],
+  [/冻结/, "ri-lock-2-line"],
+  [/备好待确认内容/, "ri-file-list-3-line"],
+  [/身份验证/, "ri-fingerprint-line"],
+  [/已办结/, "ri-checkbox-circle-line"],
+  [/执行失败|未通过/, "ri-close-circle-line"],
+  [/人工审批/, "ri-user-follow-line"],
+  [/申请已提交/, "ri-send-plane-line"],
+  [/挂失/, "ri-alarm-warning-line"],
+  [/风险|测评|确认书/, "ri-shield-star-line"],
+  [/取消/, "ri-close-line"],
+  [/拒绝|不能/, "ri-forbid-2-line"],
+];
+
+function stepIcon(label) {
+  for (const [re, icon] of STEP_ICON) if (re.test(label)) return icon;
+  return "ri-record-circle-line";
+}
+
+const STATUS_ICON = {
+  done: "ri-check-line",
+  active: "ri-loader-4-line",
+  waiting: "ri-more-line",
+  failed: "ri-close-line",
+  skipped: "ri-subtract-line",
+};
+
+/** 单条流程步骤:圆点 + 连接线 + 人话 + 归属标签 */
+function flowStepEl(step, last) {
+  const row = document.createElement("div");
+  row.className = `flow-step ${step.status}`;
+
+  const rail = document.createElement("div");
+  rail.className = "flow-rail";
+  const dot = document.createElement("span");
+  dot.className = `flow-dot ${step.status}`;
+  const mark = document.createElement("i");
+  mark.className = STATUS_ICON[step.status] ?? "ri-check-line";
+  mark.setAttribute("aria-hidden", "true");
+  dot.appendChild(mark);
+  rail.appendChild(dot);
+  if (!last) {
+    const line = document.createElement("span");
+    line.className = "flow-line";
+    rail.appendChild(line);
+  }
+  row.appendChild(rail);
+
+  const body = document.createElement("div");
+  body.className = "flow-body";
+
+  const head = document.createElement("div");
+  head.className = "flow-label";
+  const icon = document.createElement("i");
+  icon.className = `${stepIcon(step.label)} flow-ico`;
+  icon.setAttribute("aria-hidden", "true");
+  head.append(icon, document.createTextNode(step.label));
+  body.appendChild(head);
+
+  if (step.detail) {
+    const d = document.createElement("div");
+    d.className = "flow-detail";
+    d.textContent = step.detail;
+    body.appendChild(d);
+  }
+
+  const lane = document.createElement("span");
+  lane.className = `flow-lane l-${step.lane}`;
+  lane.textContent = LANE_TEXT[step.lane] ?? step.lane;
+  body.appendChild(lane);
+
+  row.appendChild(body);
+  return row;
+}
+
+/**
+ * 办理流程卡片。
+ *
+ * ★ 默认展开还是折叠,由**这一步是否还需要客户动手**决定:
+ *   还在等他确认/验证 → 展开(他需要知道下一步归谁);
+ *   已经办结 → 折叠(结果已经在回复里说清楚了,想看细节再点开)。
+ *   全部展开会让聊天记录很快被流程图淹没,全部折叠又等于没做这个功能。
+ */
+function renderFlow(flow, turn) {
+  if (!flow) return null;
+  const box = document.createElement("details");
+  box.className = "flow-card";
+  const pendingNow = Boolean(turn?.promptFor?.kind && turn.promptFor.kind !== "none");
+  if (pendingNow) box.open = true;
+
+  const head = document.createElement("summary");
+  head.className = "flow-head";
+  const title = document.createElement("span");
+  title.className = "flow-title";
+  const ico = document.createElement("i");
+  ico.className = pendingNow ? "ri-loader-4-line flow-spin" : "ri-route-line";
+  ico.setAttribute("aria-hidden", "true");
+  title.append(ico, document.createTextNode(pendingNow ? `正在办理:${flow.title}` : flow.title));
+  const badge = document.createElement("span");
+  badge.className = `flow-badge ${flow.handedToHuman ? "human" : pendingNow ? "doing" : "done"}`;
+  badge.textContent = flow.handedToHuman ? "待人工审批" : pendingNow ? "进行中" : "已办结";
+  head.append(title, badge);
+  box.appendChild(head);
+
+  const steps = document.createElement("div");
+  steps.className = "flow-steps";
+  (flow.steps ?? []).forEach((s, i) => steps.appendChild(flowStepEl(s, i === flow.steps.length - 1)));
+  box.appendChild(steps);
+
+  const summary = document.createElement("div");
+  summary.className = "flow-summary";
+  summary.textContent = flow.summary ?? "";
+  box.appendChild(summary);
+
+  /**
+   * ★ "保存为常用流程"按钮。
+   *
+   *   保存的是**服务端派生出来的意图模板**,不是界面上这段文字 ——
+   *   前端只把 traceId 递回去,模板由服务端按同一条规则生成。
+   *   (若让前端把模板内容拼好发上去,常用流程就成了一条绕过服务端的写入口。)
+   */
+  if (flow.saveable && flow.template) {
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "flow-save";
+    const si = document.createElement("i");
+    si.className = "ri-bookmark-line";
+    si.setAttribute("aria-hidden", "true");
+    save.append(si, document.createTextNode("存为常用流程"));
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      save.textContent = "保存中…";
+      try {
+        // ★ 必须把 sessionId 一起带上:资金类操作跨两轮,
+        //   "执行那一轮"的审计里没有确认卡,服务端要按会话把上一轮那张卡找回来。
+        const r = await post("/api/flows/save", {
+          traceId: turn?.traceId,
+          customerId: profile?.customerId,
+          sessionId,
+        });
+        save.className = "flow-save saved";
+        save.textContent = "已存入常用服务";
+        noteSaved(r.flow);
+      } catch (err) {
+        save.disabled = false;
+        save.textContent = "存为常用流程";
+        addMessage({ role: "agent", text: `没能保存常用流程:${err.message}`, variant: "notice" });
+      }
+    });
+    box.appendChild(save);
+  } else if (flow.template && !flow.saveable) {
+    const hint = document.createElement("div");
+    hint.className = "flow-summary";
+    hint.textContent = "这一步办成后会自动进「常用服务」,下次点一下就办。";
+    box.appendChild(hint);
+  }
+
+  return box;
+}
+
+/** 保存成功后的确认语 —— 必须说清**存在哪里**,否则客户根本找不到 */
+function noteSaved(flow) {
+  if (!flow) return;
+  addMessage({
+    role: "agent",
+    text:
+      `已保存为常用流程「${flow.name}」。它现在在**左上角抽屉 → 我的常用流程**里(以后每用一次,它会自动排到更前面)。` +
+      `\n\n下次可以直接说「${flow.say ?? flow.name}」,也可以打开抽屉点那个入口。`,
+    variant: "notice",
+  });
+}
+
+// ============================================================================
+// 渲染:数字与规则的出处(来源 / 主体 / 时效 / 计算过程)
+// ============================================================================
+
+function renderCitations(citations) {
+  const items = citations ?? [];
+  if (items.length === 0) return null;
+
+  const details = document.createElement("details");
+  details.className = "cite";
+  const head = document.createElement("summary");
+  const qi = document.createElement("i");
+  qi.className = "ri-question-line";
+  qi.setAttribute("aria-hidden", "true");
+  head.append(qi, document.createTextNode(`这些数字和规则的出处(${items.length} 条)`));
+  details.appendChild(head);
+
+  const list = document.createElement("div");
+  list.className = "cite-list";
+  for (const c of items) {
+    const item = document.createElement("div");
+    item.className = `cite-item ${c.kind ?? "data"}`;
+
+    const topic = document.createElement("div");
+    topic.className = "cite-topic";
+    topic.textContent = c.topic ?? "";
+    item.appendChild(topic);
+
+    const meta = document.createElement("div");
+    meta.className = "cite-meta";
+    meta.textContent = `来源:${c.source ?? "—"} · 主体:${c.subject ?? "—"} · 时效:${c.effective ?? "—"}`;
+    item.appendChild(meta);
+
+    if (Array.isArray(c.calculation) && c.calculation.length > 0) {
+      const calc = document.createElement("div");
+      calc.className = "cite-calc";
+      for (const line of c.calculation) {
+        const row = document.createElement("div");
+        row.textContent = line;
+        calc.appendChild(row);
+      }
+      item.appendChild(calc);
+    }
+    if (c.note) {
+      const note = document.createElement("div");
+      note.className = "cite-note";
+      note.textContent = c.note;
+      item.appendChild(note);
+    }
+    list.appendChild(item);
+  }
+  details.appendChild(list);
+  return details;
+}
+
+// ============================================================================
+// 渲染:个性化主动建议(点一下就能办)
+// ============================================================================
+
+function renderSuggestions(suggestions) {
+  const items = (suggestions ?? []).slice(0, 3);
+  if (items.length === 0) return null;
+
+  const box = document.createElement("div");
+  box.className = "suggest";
+  const title = document.createElement("div");
+  title.className = "suggest-title";
+  title.textContent = "接下来如果您愿意";
+  box.appendChild(title);
+
+  for (const s of items) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "suggest-btn";
+    const ico = document.createElement("i");
+    ico.className = "ri-lightbulb-line";
+    ico.setAttribute("aria-hidden", "true");
+    const text = document.createElement("span");
+    text.className = "suggest-text";
+    text.textContent = s.text;
+    b.append(ico, text);
+    b.addEventListener("click", () => submit(s.say));
+    box.appendChild(b);
+
+    /**
+     * ★ 把"为什么现在提"也显示出来。
+     *   主动建议最招人烦的地方就是"你凭什么猜我需要这个";
+     *   把依据摊开(基于哪几笔、哪条规则),建议才像助手而不像广告。
+     */
+    if (s.reason) {
+      const why = document.createElement("div");
+      why.className = "suggest-why";
+      why.textContent = `依据:${s.reason}`;
+      box.appendChild(why);
+    }
+  }
+  return box;
+}
+
+// ============================================================================
+// 渲染:动作按钮
+// ============================================================================
+
+function renderActions(turn) {
+  const kind = turn.promptFor?.kind;
+  if (!kind || kind === "none" || kind === "clarify") return null;
+
+  const box = document.createElement("div");
+  box.className = "actions";
+
+  if (kind === "confirm") {
+    const ok = mkBtn("确认执行", "btn-primary", () => runAction({ kind: "confirm", refId: turn.promptFor.refId }, box));
+    const no = mkBtn("取消", "btn-ghost", () => runAction({ kind: "cancel", refId: turn.promptFor.refId }, box));
+    box.append(ok, no);
+  } else if (kind === "strong_auth") {
+    // ★ 真实的手机银行这里会弹出系统人脸识别。网页做不到,
+    //   所以做成一个"模拟原生验证"的条 —— 但**回执仍然由服务端签发并验签**,
+    //   前端拿不到密钥。这一点必须保住:否则演示就变成了"前端说了算"。
+    const v = mkBtn("完成身份验证(模拟人脸)", "btn-primary", () => openAuthSheet(turn, box));
+    const no = mkBtn("取消", "btn-ghost", () => runAction({ kind: "cancel", refId: turn.promptFor.refId }, box));
+    box.append(v, no);
+  }
+
+  return box.children.length > 0 ? box : null;
+}
+
+/**
+ * 把服务端"待确认动作"视图渲染成一张可操作的卡片。
+ *
+ * ★ 为什么需要这条路:一个未决的待确认动作会**挡住客户的下一个请求** ——
+ *   系统会回一句「你还有一个操作在等你确认」并把它重述一遍。
+ *   但如果界面只把这句话当纯文本显示,用户是**无法把它处理掉**的:
+ *   他没有按钮可点,只能靠猜要回什么词。
+ *   所以遇到"被挡住"的回复时,必须顺手把那张卡的摘要与按钮补上。
+ */
+function renderPendingCard(pending) {
+  const box = document.createElement("div");
+  box.className = "ui-card";
+
+  const head = document.createElement("div");
+  head.className = "ui-card-head";
+  head.innerHTML = '<i class="ri-time-line" aria-hidden="true"></i>';
+  head.appendChild(document.createTextNode("还有一个操作在等您处理"));
+  box.appendChild(head);
+
+  const body = document.createElement("div");
+  body.className = "ui-card-body";
+
+  const row = (label, value, emph) => {
+    const r = document.createElement("div");
+    r.className = `ui-row${emph ? " emph" : ""}`;
+    const l = document.createElement("div");
+    l.className = "ui-row-label";
+    l.textContent = label;
+    const v = document.createElement("div");
+    v.className = "ui-row-value";
+    v.textContent = value;
+    r.append(l, v);
+    return r;
+  };
+
+  body.appendChild(row("待办的这件事", pending.summary || "一项待确认的操作", true));
+  if (pending.requiredTier === "strong_auth") {
+    body.appendChild(row("需要", "先完成身份验证,再确认"));
+  }
+  // 冻结载荷里挑出用户看得懂的几项(全部来自服务端已剥离内部字段的视图)
+  const fp = pending.frozenPayload ?? {};
+  if (fp.payeeName) body.appendChild(row("收款人", String(fp.payeeName)));
+  if (typeof fp.amount === "number") body.appendChild(row("金额", `¥${fp.amount.toLocaleString("zh-CN")}`));
+  if (fp.memo) body.appendChild(row("备注", String(fp.memo)));
+  if (fp.cardId) body.appendChild(row("涉及卡片", String(fp.cardId)));
+  box.appendChild(body);
+
+  const warn = document.createElement("div");
+  warn.className = "ui-card-warn";
+  warn.textContent =
+    "这张卡是您上一句话冻结下来的内容。为了不出现「以为办好了、其实没办」,请先把这一笔处理掉。";
+  box.appendChild(warn);
+
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  actions.style.padding = "10px 13px";
+  const isAuth = pending.requiredTier === "strong_auth";
+  actions.append(
+    mkBtn(isAuth ? "完成身份验证" : "确认执行", "btn-primary", () => {
+      if (isAuth) openAuthSheet({ promptFor: { kind: "strong_auth", refId: pending.pendingId } }, actions);
+      else runAction({ kind: "confirm", refId: pending.pendingId }, actions);
+    }),
+    mkBtn("取消", "btn-ghost", () => runAction({ kind: "cancel", refId: pending.pendingId }, actions)),
+  );
+  box.appendChild(actions);
+
+  return box;
+}
+
+function mkBtn(label, cls, onClick) {
+  const b = document.createElement("button");
+  b.className = `btn ${cls}`;
+  b.type = "button";
+  b.textContent = label;
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+async function runAction(action, box) {
+  if (busy) return;
+  if (box) for (const b of box.querySelectorAll("button")) b.disabled = true;
+  busy = true;
+  setThinking(true);
+  try {
+    const turn = await sendAction(action);
+    renderTurn(turn);
+  } catch (err) {
+    addMessage({ role: "agent", text: `操作没有完成:${err.message}`, variant: "notice" });
+  } finally {
+    busy = false;
+    setThinking(false);
+  }
+}
+
+// ============================================================================
+// 强验证弹层
+// ============================================================================
+
+/**
+ * 强验证弹层。
+ *
+ * ★ 两个必须守住的点(实测被客户点出来的):
+ *   ① **一按即失效** —— 点过"完成身份验证"之后,同一组按钮不能再点第二次。
+ *      过去按钮只在"确认执行"这条路上被禁用,验证这条路没禁:客户连点两下,
+ *      会开出两层弹层;验证通过后旧按钮还亮着,再点一次就变成"没有待确认的操作"。
+ *      处理:打开弹层的同时禁用触发它的那组按钮;取消或验证前的失败再恢复。
+ *   ② **签的必须是这一笔的载荷** —— 弹层只对 `refId` 指向的那条待办签发回执,
+ *      不取"当前最新的一条"。否则先验证 A、中途又发起 B,再点 A 的按钮
+ *      就会给 B 盖章(界面在办 A,服务端盖的是 B 的章)。
+ */
+function openAuthSheet(turn, box) {
+  // 触发按钮立即禁用;成功办结后保持禁用,失败的中间步骤再恢复(见 release)
+  const triggerButtons = box ? [...box.querySelectorAll("button")] : [];
+  for (const b of triggerButtons) b.disabled = true;
+  const release = () => {
+    for (const b of triggerButtons) if (b.isConnected) b.disabled = false;
+  };
+
+  const refId = turn?.promptFor?.refId;
+  const mask = document.createElement("div");
+  mask.className = "sheet-mask";
+
+  const sheet = document.createElement("div");
+  sheet.className = "sheet";
+  sheet.innerHTML = "";
+
+  const face = document.createElement("div");
+  face.className = "sheet-face";
+  face.innerHTML = '<i class="ri-scan-face-line" aria-hidden="true"></i>';
+  sheet.appendChild(face);
+
+  const h = document.createElement("h3");
+  h.textContent = "身份验证";
+  sheet.appendChild(h);
+
+  const p = document.createElement("p");
+  p.textContent = "为完成这笔操作,需要验证您的身份。真机上这里会弹出系统人脸识别 / 指纹窗口。";
+  sheet.appendChild(p);
+
+  const btns = document.createElement("div");
+  btns.className = "sheet-btns";
+
+  /** 按 refId 取这一笔的载荷哈希;取不到说明已经办完或已过期 —— 不能再签任何东西 */
+  const loadTarget = async () => {
+    const q = new URLSearchParams({ customerId: profile?.customerId ?? "" });
+    if (refId) q.set("refId", refId);
+    const r = await get(`/api/demo/pending?${q.toString()}`);
+    if (!r.pending) throw new Error("这笔操作已经处理过了(或已过期),不用再验证一次");
+    return r.pending;
+  };
+
+  const pass = document.createElement("button");
+  pass.className = "btn btn-primary";
+  pass.type = "button";
+  pass.textContent = "模拟验证通过";
+  pass.addEventListener("click", async () => {
+    pass.disabled = true;
+    fail.disabled = true;
+    cancel.disabled = true;
+    pass.textContent = "验证中…";
+    try {
+      // ★ 三步,每一步都由服务端决定:
+      //   ① 取**这一笔**的载荷哈希 → ② 请"安全环境"签发回执 → ③ 带着回执确认
+      const target = await loadTarget();
+      const p2 = await post("/api/demo/sign-auth-proof", {
+        method: "biometric",
+        payloadHash: target.payloadHash,
+      });
+      mask.remove();
+      // 走到这里已经"执行过"了:按钮保持禁用,不再给第二次机会
+      await runAction({ kind: "confirm", refId: target.pendingId, authProof: p2.proof }, null);
+    } catch (err) {
+      mask.remove();
+      release();
+      addMessage({ role: "agent", text: `验证没有完成:${err.message}`, variant: "notice" });
+    }
+  });
+
+  const fail = document.createElement("button");
+  fail.className = "btn btn-ghost";
+  fail.type = "button";
+  fail.textContent = "模拟验证失败(演示签名校验)";
+  fail.addEventListener("click", async () => {
+    pass.disabled = true;
+    fail.disabled = true;
+    cancel.disabled = true;
+    try {
+      const target = await loadTarget();
+      const p2 = await post("/api/demo/sign-auth-proof", {
+        method: "biometric",
+        payloadHash: target.payloadHash,
+      });
+      // 篡改签名第一位 —— 服务端验签必须失败
+      const bad = { ...p2.proof, signature: (p2.proof.signature[0] === "a" ? "b" : "a") + p2.proof.signature.slice(1) };
+      mask.remove();
+      await runAction({ kind: "confirm", refId: target.pendingId, authProof: bad }, null);
+    } catch (err) {
+      mask.remove();
+      release();
+      addMessage({ role: "agent", text: `验证没有完成:${err.message}`, variant: "notice" });
+    }
+  });
+
+  const cancel = document.createElement("button");
+  cancel.className = "btn btn-ghost";
+  cancel.type = "button";
+  cancel.textContent = "取消";
+  cancel.addEventListener("click", () => {
+    mask.remove();
+    // 只是关掉弹层、没做任何验证 —— 按钮恢复,客户可以重新点
+    release();
+  });
+
+  btns.append(pass, fail, cancel);
+  sheet.appendChild(btns);
+
+  const note = document.createElement("div");
+  note.className = "sheet-note";
+  note.textContent =
+    "回执由服务端的可信环境签发并验签,前端拿不到密钥 —— 所以即使前端被改,也伪造不出验证。";
+  sheet.appendChild(note);
+
+  mask.appendChild(sheet);
+  $("device").appendChild(mask);
+
+  if (!turn) {
+    mask.remove();
+    release();
+  }
+}
+
+// ============================================================================
+// 渲染:可视块(材料比对 / 复核决策 / 误报撤回)
+//
+// ★ 这三块共同点是"关系比数值重要",所以用对照表 / 评分条 / 前后对照来画,
+//   而不是把它们塞回一段话里。服务端只给结构与语义(冲突/一致、成本/风险),
+//   配色与排版在这里 —— 与流程卡同一条边界:前端不做业务判断。
+// ============================================================================
+
+function visualChip(text, cls) {
+  const s = document.createElement("span");
+  s.className = `v-chip ${cls}`;
+  s.textContent = text;
+  return s;
+}
+
+/** 材料比对:列=材料,行=字段;矛盾行高亮,差异格加 ≠ */
+function renderDocDiff(v) {
+  const box = document.createElement("div");
+  box.className = "visual doc-diff";
+
+  const head = document.createElement("div");
+  head.className = "v-head";
+  const t = document.createElement("div");
+  t.className = "v-title";
+  t.textContent = v.title;
+  head.appendChild(t);
+  head.appendChild(
+    visualChip(v.conflictCount > 0 ? `${v.conflictCount} 处矛盾` : "关键信息一致", v.conflictCount > 0 ? "bad" : "ok"),
+  );
+  box.appendChild(head);
+
+  const verdict = document.createElement("div");
+  verdict.className = `v-verdict ${v.conflictCount > 0 ? "warn" : "ok"}`;
+  verdict.textContent = v.verdict;
+  box.appendChild(verdict);
+
+  const table = document.createElement("div");
+  table.className = "dd-table";
+  table.style.setProperty("--cols", String(v.documents.length));
+
+  // 表头:空 + 每份材料的种类标签
+  const header = document.createElement("div");
+  header.className = "dd-row dd-header";
+  const corner = document.createElement("div");
+  corner.className = "dd-label";
+  corner.textContent = "字段";
+  header.appendChild(corner);
+  for (const d of v.documents) {
+    const c = document.createElement("div");
+    c.className = "dd-cell dd-doc";
+    const k = document.createElement("div");
+    k.className = "dd-doc-kind";
+    k.textContent = d.kindLabel;
+    const n = document.createElement("div");
+    n.className = "dd-doc-name";
+    n.textContent = d.label;
+    c.append(k, n);
+    header.appendChild(c);
+  }
+  table.appendChild(header);
+
+  for (const row of v.rows ?? []) {
+    const r = document.createElement("div");
+    r.className = `dd-row dd-${row.severity}`;
+    const label = document.createElement("div");
+    label.className = "dd-label";
+    label.textContent = row.label;
+    r.appendChild(label);
+    for (const cell of row.values ?? []) {
+      const c = document.createElement("div");
+      c.className = `dd-cell${cell.differs ? " dd-diff" : ""}`;
+      c.textContent = cell.text;
+      if (cell.differs) {
+        const mark = document.createElement("span");
+        mark.className = "dd-mark";
+        mark.textContent = "≠";
+        mark.setAttribute("aria-label", "与其它材料不一致");
+        c.appendChild(mark);
+      }
+      r.appendChild(c);
+    }
+    if (row.note && row.severity !== "ok") {
+      const note = document.createElement("div");
+      note.className = "dd-note";
+      note.textContent = row.note;
+      r.appendChild(note);
+    }
+    table.appendChild(r);
+  }
+  box.appendChild(table);
+
+  if (Array.isArray(v.actions) && v.actions.length > 0) {
+    box.appendChild(visualActions(v.actions));
+  }
+  return box;
+}
+
+/** 复核决策:两条评分 + 结论 + 缺口 */
+function renderReviewPlan(v) {
+  const box = document.createElement("div");
+  box.className = "visual review-plan";
+
+  const head = document.createElement("div");
+  head.className = "v-head";
+  const t = document.createElement("div");
+  t.className = "v-title";
+  t.textContent = v.title;
+  head.appendChild(t);
+  head.appendChild(visualChip(v.decisionLabel, v.decision === "inspect_gaps" ? "ok" : "info"));
+  box.appendChild(head);
+
+  const bars = document.createElement("div");
+  bars.className = "rp-bars";
+  for (const [label, score, hint] of [
+    ["重扫成本", v.rescanCost.score, "再算一遍要花多少功夫"],
+    ["遗漏风险", v.omissionRisk.score, "上次没看到的部分有多重要"],
+  ]) {
+    const row = document.createElement("div");
+    row.className = "rp-bar-row";
+    const l = document.createElement("div");
+    l.className = "rp-bar-label";
+    l.textContent = label;
+    const track = document.createElement("div");
+    track.className = "rp-track";
+    const fill = document.createElement("div");
+    const cls = label === "遗漏风险" ? (score >= 60 ? "risk-high" : score >= 30 ? "risk-mid" : "risk-low") : "cost";
+    fill.className = `rp-fill ${cls}`;
+    fill.style.width = `${Math.max(3, Math.min(100, score))}%`;
+    track.appendChild(fill);
+    const num = document.createElement("div");
+    num.className = "rp-bar-num";
+    num.textContent = String(score);
+    num.title = hint;
+    row.append(l, track, num);
+    bars.appendChild(row);
+  }
+  box.appendChild(bars);
+
+  const details = document.createElement("details");
+  details.className = "rp-why";
+  const sm = document.createElement("summary");
+  sm.textContent = "这两项是怎么算的";
+  details.appendChild(sm);
+  for (const f of [...(v.rescanCost.factors ?? []), ...(v.omissionRisk.factors ?? [])]) {
+    const line = document.createElement("div");
+    line.className = "rp-factor";
+    line.textContent = f;
+    details.appendChild(line);
+  }
+  box.appendChild(details);
+
+  if (Array.isArray(v.gaps) && v.gaps.length > 0) {
+    const g = document.createElement("div");
+    g.className = "rp-gaps";
+    for (const gap of v.gaps) {
+      const line = document.createElement("div");
+      line.className = "rp-gap";
+      line.textContent = `· ${gap}`;
+      g.appendChild(line);
+    }
+    box.appendChild(g);
+  }
+
+  if (Array.isArray(v.actions) && v.actions.length > 0) {
+    box.appendChild(visualActions(v.actions));
+  }
+  return box;
+}
+
+/** 误报撤回:证据 → 撤回 → 仍需复核 */
+function renderRetraction(v) {
+  const box = document.createElement("div");
+  box.className = "visual retraction";
+
+  const head = document.createElement("div");
+  head.className = "v-head";
+  const t = document.createElement("div");
+  t.className = "v-title";
+  t.textContent = v.title;
+  head.appendChild(t);
+  head.appendChild(visualChip(`撤回 ${v.withdrawn.length} 条`, "ok"));
+  box.appendChild(head);
+
+  const ev = document.createElement("div");
+  ev.className = "rt-evidence";
+  const evLabel = document.createElement("div");
+  evLabel.className = "rt-evidence-label";
+  evLabel.textContent = "依据您的补充说明";
+  const evText = document.createElement("div");
+  evText.className = "rt-evidence-text";
+  evText.textContent = v.evidence;
+  ev.append(evLabel, evText);
+  box.appendChild(ev);
+
+  for (const w of v.withdrawn ?? []) {
+    const item = document.createElement("div");
+    item.className = "rt-item rt-withdrawn";
+    const mark = document.createElement("span");
+    mark.className = "rt-mark";
+    mark.textContent = "已撤回";
+    const body = document.createElement("div");
+    const title = document.createElement("div");
+    title.className = "rt-title";
+    title.textContent = w.title;
+    const reason = document.createElement("div");
+    reason.className = "rt-reason";
+    reason.textContent = `原判定依据:${w.reason}`;
+    body.append(title, reason);
+    item.append(mark, body);
+    box.appendChild(item);
+  }
+
+  if ((v.stillOpen ?? []).length > 0) {
+    const sub = document.createElement("div");
+    sub.className = "rt-sub";
+    sub.textContent = `仍需您复核(${v.stillOpen.length})`;
+    box.appendChild(sub);
+    for (const s of v.stillOpen) {
+      const item = document.createElement("div");
+      item.className = "rt-item rt-open";
+      const mark = document.createElement("span");
+      mark.className = "rt-mark";
+      mark.textContent = s.severity === "high" ? "高" : s.severity === "medium" ? "中" : "低";
+      const body = document.createElement("div");
+      const title = document.createElement("div");
+      title.className = "rt-title";
+      title.textContent = s.title;
+      const reason = document.createElement("div");
+      reason.className = "rt-reason";
+      reason.textContent = s.reason;
+      body.append(title, reason);
+      item.append(mark, body);
+      box.appendChild(item);
+    }
+  } else {
+    const done = document.createElement("div");
+    done.className = "rt-sub";
+    done.textContent = "清单里没有其它待复核的异常了。";
+    box.appendChild(done);
+  }
+
+  if (Array.isArray(v.actions) && v.actions.length > 0) {
+    box.appendChild(visualActions(v.actions));
+  }
+  return box;
+}
+
+/** 可视块底部的动作按钮(点了就是发一句话,不是隐藏逻辑) */
+function visualActions(actions) {
+  const bar = document.createElement("div");
+  bar.className = "v-actions";
+  for (const a of actions) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "v-action";
+    b.textContent = a.label;
+    b.addEventListener("click", () => submit(a.say));
+    bar.appendChild(b);
+  }
+  return bar;
+}
+
+function renderVisual(visual) {
+  if (!visual) return null;
+  if (visual.kind === "doc_diff") return renderDocDiff(visual);
+  if (visual.kind === "review_plan") return renderReviewPlan(visual);
+  if (visual.kind === "retraction") return renderRetraction(visual);
+  return null;
+}
+
+// ============================================================================
+// 回合渲染
+// ============================================================================
+
+/**
+ * ★ 业务线程 → 流程卡 DOM 的映射。
+ *
+ *   资金类操作跨两轮(先"等你确认"、再"已办结")。若每轮都新画一张卡,
+ *   客户会看到上面一张永远停在"进行中",下面又冒出一张"已办结" ——
+ *   实测被点名的就是这个:"我按确认后成功办理了,你的流程图没有更新,还依旧是进行中"。
+ *
+ *   所以同一 threadId 只保留**一张**卡:新一轮到达时把旧卡换掉、
+ *   新卡插到最新那条回复下面(于是它"每次办理都在",且状态跟着事实走)。
+ */
+const flowCards = new Map();
+
+/**
+ * 从回复文本里折掉"卡片正文"。
+ *
+ * 服务端会把确认卡的每个字段同时写进文本(审计与文字渠道需要完整的一份),
+ * 而界面上已经渲染了结构化卡片。若原样显示,客户会在一屏里看到两张一样的卡。
+ * 所以在展示层把 `【标题】…` 那一段折掉 —— 证据链不动,只改呈现。
+ */
+function stripCardBlock(text, card) {
+  const raw = String(text ?? "");
+  const title = card?.title;
+  if (!title) return raw;
+  const marker = `【${title}】`;
+  const idx = raw.indexOf(marker);
+  if (idx < 0) return raw;
+
+  const head = raw.slice(0, idx);
+  const tail = raw.slice(idx).split("\n");
+  // 标题行之后,凡是"字段行 / 空行 / 分隔线 / 可撤销 / 请注意"都属于这张卡
+  const isCardLine = (l) => {
+    const t = l.trim();
+    if (t === "") return true;
+    if (/^─+$/.test(t)) return true;
+    if (/^(可撤销|请注意|⚠️)/.test(t)) return true;
+    return /^[^:：\n]{1,14}[:：]/.test(t);
+  };
+  let i = 1;
+  while (i < tail.length && isCardLine(tail[i])) i += 1;
+  return `${head}${tail.slice(i).join("\n")}`.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function renderTurn(turn) {
+  const card = renderCard(turn.card);
+  const policy = renderPolicy(turn.policySummary);
+  const actions = renderActions(turn);
+  const cites = renderCitations(turn.citations);
+  const suggests = renderSuggestions(turn.suggestions);
+  const visual = renderVisual(turn.visual);
+
+  // 先处理流程卡:同一线程的旧卡要原地退役(避免聊天记录里堆一串"进行中")
+  let flow = null;
+  if (turn.flow) {
+    flow = renderFlow(turn.flow, turn);
+    const threadId = turn.flow.threadId ?? turn.flow.flowKey;
+    const previous = flowCards.get(threadId);
+    if (previous) {
+      previous.remove();
+      // 同一件事的第二次渲染:闪一下,让客户注意到状态变了。
+      // 不强制展开 —— 办结后链路细节不该再占屏幕,想看再点开。
+      flow.classList.add("is-update");
+    }
+    flowCards.set(threadId, flow);
+  }
+
+  // 有结构化卡片时:文本与卡片放进同一个"堆栈",视觉上属于同一条回复
+  if (card || policy || actions || flow || cites || suggests || visual) {
+    const stack = document.createElement("div");
+    stack.className = "stack";
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.appendChild(renderText(stripCardBlock(turn.reply, turn.card)));
+    stack.appendChild(bubble);
+    // 可视块紧跟结论:它是这一轮最重要的信息
+    if (visual) stack.appendChild(visual);
+    if (card) stack.appendChild(card);
+    if (actions) stack.appendChild(actions);
+    /**
+     * ★ 顺序有意为之:先看他能做什么(卡片/按钮),再看他走到哪了(流程),
+     *   最后才是"凭什么信这些数字"(出处)与"还能做什么"(建议)。
+     *   把流程提到按钮之前,会让需要确认的那一步被推到屏幕下方 ——
+     *   客户的第一反应是"我要点哪里",而不是"你经历了什么"。
+     */
+    if (flow) stack.appendChild(flow);
+    if (cites) stack.appendChild(cites);
+    if (policy) stack.appendChild(policy);
+    if (suggests) stack.appendChild(suggests);
+    addMessage({ role: "agent", stack });
+  } else {
+    const variant = turn.terminal?.kind === "denied" ? "denied" : undefined;
+    const wrap = addMessage({ role: "agent", text: stripCardBlock(turn.reply, turn.card), variant });
+    if (policy) wrap.appendChild(policy);
+  }
+
+  pending = turn.promptFor?.kind && turn.promptFor.kind !== "none" ? turn.promptFor : null;
+
+  // ★ 被"悬空待确认动作"挡住时,把那张卡补出来。
+  //
+  //   系统会回一句「你还有一个操作在等确认」并把它重述一遍 ——
+  //   但如果界面只把它当纯文本显示,用户是**没办法把它处理掉**的:
+  //   他没有按钮可点,只能靠猜要回什么词。所以这里顺手把可操作的卡补上。
+  if (/还有一个操作在等/.test(turn.reply ?? "")) {
+    void appendPendingCard();
+  }
+
+  return turn;
+}
+
+/** 拉取当前待确认动作并渲染成可操作卡片 */
+async function appendPendingCard() {
+  try {
+    const p = (await get("/api/demo/pending")).pending;
+    if (!p) return;
+    const card = renderPendingCard(p);
+    const wrap = document.createElement("div");
+    wrap.className = "msg agent";
+    const av = document.createElement("div");
+    av.className = "avatar";
+    av.innerHTML = '<i class="ri-robot-2-line" aria-hidden="true"></i>';
+    const stack = document.createElement("div");
+    stack.className = "stack";
+    stack.appendChild(card);
+    wrap.append(av, stack);
+    messagesEl.appendChild(wrap);
+    scrollToEnd();
+  } catch {
+    // 拉不到就算了 —— 这只是体验补强,不该反过来打断主流程
+  }
+}
+
+function setThinking(on) {
+  let el = document.getElementById("thinking");
+  if (on && !el) {
+    el = document.createElement("div");
+    el.id = "thinking";
+    el.className = "msg agent";
+    el.innerHTML =
+      '<div class="avatar"><i class="ri-robot-2-line" aria-hidden="true"></i></div>' +
+      '<div class="bubble"><div class="typing"><i></i><i></i><i></i></div></div>';
+    messagesEl.appendChild(el);
+    scrollToEnd();
+  } else if (!on && el) {
+    el.remove();
+  }
+  sendBtn.disabled = on;
+}
+
+function scrollToEnd() {
+  requestAnimationFrame(() => {
+    paneChat.scrollTop = paneChat.scrollHeight;
+  });
+}
+
+// ============================================================================
+// 提交
+// ============================================================================
+
+async function submit(text) {
+  const value = String(text ?? "").trim();
+  if (!value || busy) return;
+  busy = true;
+  setThinking(true);
+  addMessage({ role: "user", text: value });
+  inputEl.value = "";
+  try {
+    const turn = await sendText(value);
+    renderTurn(turn);
+  } catch (err) {
+    addMessage({ role: "agent", text: `没能完成:${err.message}`, variant: "notice" });
+  } finally {
+    busy = false;
+    setThinking(false);
+    inputEl.focus();
+  }
+}
+
+formEl.addEventListener("submit", (e) => {
+  e.preventDefault();
+  submit(inputEl.value);
+});
+
+// 移动端键盘弹起时,把对话滚到底
+inputEl.addEventListener("focus", () => {
+  setTimeout(scrollToEnd, 260);
+});
+
+// ============================================================================
+// 首页引导(空会话时)
+//
+// ★ 布局:对话区只放一条轻量问候;常用服务 / 我的常用流程 / 我的卡片 /
+//   账户概览 / 主动建议全部收进左上角抽屉。空会话时界面只剩"一句话 + 输入框",
+//   需要入口时再滑出抽屉 —— 这是"整体简洁"的主要来源。
+// ============================================================================
+
+const QUICK = [
+  { icon: "ri-bank-card-line", label: "我的卡片", text: "我有哪些卡?" },
+  { icon: "ri-line-chart-line", label: "额度管理", text: "信用卡额度太低能不能提额" },
+  { icon: "ri-alarm-warning-line", label: "挂失冻结", text: "卡丢了先挂失" },
+  { icon: "ri-lock-unlock-line", label: "解除限制", text: "卡被限制了帮我解开" },
+  { icon: "ri-add-circle-line", label: "办新卡", text: "想办一张新卡" },
+  { icon: "ri-exchange-funds-line", label: "转账汇款", text: "给老妈转500,备注买菜" },
+  { icon: "ri-bar-chart-2-line", label: "账单分析", text: "上个月账单报告" },
+  { icon: "ri-coins-line", label: "理财推荐", text: "我有5万块,推荐几个理财产品" },
+];
+
+/** 对话区的开场:一条问候,入口指向左上抽屉,不再堆一整屏宫格 */
+function renderWelcome() {
+  const name = profile?.displayName ?? "张先生";
+  addMessage({
+    role: "agent",
+    text: `${name},您好!有任何业务可以直接说,也可以点左上角按钮打开「常用服务 / 我的卡片 / 账户概览」。`,
+  });
+}
+
+function sectionTitle(text) {
+  const t = document.createElement("div");
+  t.className = "section-title";
+  t.textContent = text;
+  return t;
+}
+
+/** 抽屉头:姓名 + 总资产(概览数字放在最显眼的位置) */
+function fillDrawerHead() {
+  drawerName.textContent = profile?.displayName ?? "张先生";
+  const accounts = profile?.accounts ?? [];
+  const total = accounts.reduce((sum, a) => sum + (Number(a.balance) || 0), 0);
+  drawerSub.textContent = `总资产 ¥${total.toLocaleString("zh-CN")}`;
+}
+
+/**
+ * 常用流程的快捷入口。
+ *
+ * ★ 点一下**不是**直接执行,而是把模板实例化成一句话放进输入框:
+ *   常用流程省的是打字,不是确认 —— 金额每次都可能不同,
+ *   客户需要看到系统到底理解成了哪一句,才有机会改。
+ *   (自动发送会让人担心"我点错了会不会直接转出去"。)
+ */
+function flowChip(f) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "flow-chip";
+
+  const top = document.createElement("div");
+  top.className = "flow-chip-name";
+  const ico = document.createElement("i");
+  ico.className = "ri-bookmark-3-line";
+  ico.setAttribute("aria-hidden", "true");
+  top.append(ico, document.createTextNode(f.name));
+
+  const sub = document.createElement("div");
+  sub.className = "flow-chip-say";
+  sub.textContent = f.say ?? "";
+
+  const meta = document.createElement("div");
+  meta.className = "flow-chip-meta";
+  meta.textContent = (f.useCount ?? 0) > 0 ? `用过 ${f.useCount} 次` : "还没用过";
+
+  b.append(top, sub, meta);
+  b.addEventListener("click", async () => {
+    try {
+      const r = await post("/api/flows/instantiate", {
+        templateId: f.templateId,
+        customerId: profile?.customerId,
+      });
+      inputEl.value = r.text;
+      inputEl.focus();
+      // 把光标放到句尾,客户直接改数字即可
+      inputEl.setSelectionRange(r.text.length, r.text.length);
+    } catch (err) {
+      addMessage({ role: "agent", text: `这条常用流程取不出来了:${err.message}`, variant: "notice" });
+    }
+  });
+  return b;
+}
+
+function uiRow(label, value) {
+  const row = document.createElement("div");
+  row.className = "ui-row";
+  const l = document.createElement("div");
+  l.className = "ui-row-label";
+  l.textContent = label;
+  const v = document.createElement("div");
+  v.className = "ui-row-value";
+  v.textContent = value;
+  row.append(l, v);
+  return row;
+}
+
+/** 抽屉内容:常用服务 / 我的常用流程 / 我的卡片 / 主动建议 / 账户概览 */
+function renderDrawer() {
+  drawerBody.innerHTML = "";
+  const hero = document.createElement("div");
+  hero.className = "hero";
+
+  // 常用服务
+  hero.appendChild(sectionTitle("常用服务"));
+  const quick = document.createElement("div");
+  quick.className = "quick";
+  for (const q of QUICK) {
+    const b = document.createElement("button");
+    b.type = "button";
+    const icon = document.createElement("i");
+    icon.className = `qi ${q.icon}`;
+    icon.setAttribute("aria-hidden", "true");
+    const lab = document.createElement("span");
+    lab.textContent = q.label;
+    b.append(icon, lab);
+    b.addEventListener("click", () => submit(q.text));
+    quick.appendChild(b);
+  }
+  hero.appendChild(quick);
+
+  /**
+   * ★ 客户自己的常用流程:只展示**真的用过**的一两条。
+   *
+   *   上一版是"办成一件事就自动记住",于是常用服务里堆了一串系统塞进来的条目 ——
+   *   客户的原话是"不要举例那么多,搞一两个我用过有次数在那就好"。
+   *   所以这里:
+   *     · 按使用次数排序,最多两条;
+   *     · 一条都没用过时,显示最近添加的那一条(否则客户刚存完却看不到,会以为没存上);
+   *     · 入口名里带"用过 N 次",客户一眼知道这是自己常用的,而不是系统推荐的。
+   */
+  const allFlows = profile?.personalization?.flows ?? [];
+  const usedFlows = allFlows
+    .filter((f) => (f.useCount ?? 0) > 0)
+    .sort((a, b) => (b.useCount ?? 0) - (a.useCount ?? 0))
+    .slice(0, 2);
+  const myFlows = usedFlows.length > 0 ? usedFlows : allFlows.slice(0, 1);
+
+  if (myFlows.length > 0) {
+    hero.appendChild(sectionTitle("我的常用流程"));
+
+    const strip = document.createElement("div");
+    strip.className = "flows";
+    for (const f of myFlows) {
+      strip.appendChild(flowChip(f));
+    }
+    hero.appendChild(strip);
+  }
+
+  // 卡片概览
+  const cards = profile?.cards ?? [];
+  if (cards.length > 0) {
+    hero.appendChild(sectionTitle(`我的卡片(${cards.length} 张)`));
+
+    const strip = document.createElement("div");
+    strip.className = "mini-cards";
+    for (const c of cards) {
+      strip.appendChild(miniCard(c));
+    }
+    hero.appendChild(strip);
+  }
+
+  /**
+   * ★ 抽屉里的主动建议。
+   *
+   *   与对话里的建议同源(同一条规则、同一份依据)。抽屉是"客户还没开口"时
+   *   最常翻开的面板,这里出现一条有依据的建议,才是"个性化"最有价值的位置。
+   *   数据来自 /api/personalization(启动时拉取一次)。
+   */
+  const drawerSuggests = renderSuggestions(profile?.personalization?.suggestions ?? []);
+  if (drawerSuggests) {
+    hero.appendChild(sectionTitle("我想到可以帮您做的事"));
+    hero.appendChild(drawerSuggests);
+  }
+
+  // 账户概览
+  hero.appendChild(sectionTitle("账户概览"));
+  const note = document.createElement("div");
+  note.className = "ui-card";
+  const nb = document.createElement("div");
+  nb.className = "ui-card-body";
+
+  // 总资产突出为大数字,各账户以小字逐行列出,避免一行挤多个账户
+  const accounts = profile?.accounts ?? [];
+  const total = accounts.reduce((sum, a) => sum + (Number(a.balance) || 0), 0);
+
+  const totalRow = uiRow("总资产", `¥${total.toLocaleString("zh-CN")}`);
+  totalRow.classList.add("total");
+  nb.appendChild(totalRow);
+  for (const a of accounts) {
+    const r = uiRow(`尾号 ${a.maskedNo.slice(-4)}`, `¥${Number(a.balance).toLocaleString("zh-CN")}`);
+    r.classList.add("acct");
+    nb.appendChild(r);
+  }
+  nb.appendChild(uiRow("风险等级", profile?.wealth?.assessed ? `${profile.wealth.level}(${profile.wealth.levelLabel})` : "未测评"));
+  // nb.appendChild(uiRow("服务渠道", "手机银行 App(低风险 · 支持人脸)"));
+
+  note.appendChild(nb);
+  hero.appendChild(note);
+
+  drawerBody.appendChild(hero);
+}
+
+function miniCard(c) {
+  const el = document.createElement("div");
+  el.className = "mini-card";
+
+  // 状态 → 标签。卡片本体一律白底,异常状态用标签颜色表达,不再整张变色
+  const status = document.createElement("span");
+  status.className = "mc-status";
+  status.textContent = c.restrictionCauseLabel ? `${c.statusLabel} · ${c.restrictionCauseLabel}` : c.statusLabel;
+  if (c.status === "lost" || c.status === "frozen" || c.restrictionCause) status.classList.add("bad");
+  else if (c.status === "pending_activation" || c.status === "replacement_in_transit") status.classList.add("warn");
+  else status.classList.add("ok");
+
+  const top = document.createElement("div");
+  top.className = "mc-top";
+  const name = document.createElement("div");
+  name.className = "mc-name";
+  name.textContent = c.productName;
+  top.append(name, status);
+
+  const no = document.createElement("div");
+  no.className = "mc-no";
+  no.textContent = `**** ${c.last4}`;
+
+  const foot = document.createElement("div");
+  foot.className = "mc-foot";
+  const left = document.createElement("span");
+  left.textContent = c.kindLabel;
+  const right = document.createElement("span");
+  right.className = "mc-limit";
+  right.textContent = c.creditLimit != null ? `额度 ¥${Number(c.creditLimit).toLocaleString("zh-CN")}` : "借记卡";
+  foot.append(left, right);
+
+  el.append(top, no, foot);
+
+  el.addEventListener("click", () => submit(`尾号${c.last4}那张额度多少`));
+  return el;
+}
+
+// ============================================================================
+// 历史记录(只读)
+//
+// ★ 三条边界,缺一不可:
+//   ① 只读:详情里**不渲染任何**确认/取消/再确认按钮 —— 服务端也不返回 pendingId。
+//      客户想再办一次,只能走「再办一次」→ 新会话 → 重新确认与验证。
+//   ② 状态与色调全部用服务端给的 statusLabel / tone,前端只负责上色(红线 #8)。
+//   ③ 「再办一次」= 换一个新 sessionId + 预填上一轮用户原话,
+//      绝不是"复用上一笔的待办"—— 旧会话的待办不受影响。
+// ============================================================================
+
+const REPLAY_PREFILL_KEY = "bank-agent-replay-prefill";
+
+/**
+ * ★ 列表与详情共用这一句,所以它必须覆盖两种粒度:
+ *   列表的一行 = **一笔业务**(台账粒度);详情 = 这笔业务 + 它所属对话的回放。
+ *   两种视图都**不能办事** —— 这句话是界面上的第一层,后端"不返回 pendingId"
+ *   与跨会话确认拒绝(G2/G3)是第二、第三层。
+ */
+const HISTORY_BANNER =
+  "历史记录仅供查看,不能在这里确认或撤销任何操作。要再办一次,在详情里点『再办一次』—— 会重新走确认与验证。";
+
+function fmtHistoryTime(ts) {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+async function openHistory() {
+  if (!paneAudit.hidden) closeAudit();
+  paneChat.hidden = true;
+  paneHistory.hidden = false;
+  composer.hidden = true;
+  btnBack.hidden = false;
+  appbarSub.textContent = "历史记录 · 只读";
+  await refreshHistory();
+}
+
+function closeHistory() {
+  paneHistory.hidden = true;
+  paneChat.hidden = false;
+  composer.hidden = false;
+  btnBack.hidden = true;
+  appbarSub.textContent = "在线 · 支持转账 / 账单 / 理财 / 卡片";
+  scrollToEnd();
+}
+
+/**
+ * 列表:一行**一笔业务**(台账粒度),按时间倒序。
+ *
+ * ★ 为什么不是一行一个会话(这一版改掉的东西):
+ *   前端一个标签页自始至终只有一个 sessionId,所以"一天办了好几件事"全都落在
+ *   同一个会话里。按会话出行的话,第 2 笔起就看不见了 —— 标题只认第一笔,
+ *   状态是全会话的聚合(一笔「已提交待审核」会盖住另一笔「已转账成功」)。
+ *   客户在历史里找的是**那一笔**,行的身份就必须是那一笔(opId)。
+ *
+ *   会话依旧是可回放的容器:每行带 sessionId,点进去看那次对话的原话与卡片。
+ */
+async function refreshHistory() {
+  historyBody.innerHTML = "";
+  let data;
+  try {
+    const q = new URLSearchParams({
+      current: sessionId,
+      customerId: profile?.customerId ?? "",
+      limit: "50",
+    });
+    data = await get(`/api/ledger/recent?${q.toString()}`);
+  } catch (err) {
+    historyBody.appendChild(historyNotice(`读取历史失败:${err.message}`));
+    return;
+  }
+
+  const operations = data.operations ?? [];
+  if (operations.length === 0) {
+    historyBody.appendChild(historyNotice("还没有历史记录。办完第一件事之后,这里会有可回看的办理记录。"));
+    return;
+  }
+
+  historyBody.appendChild(historyBanner());
+
+  const list = document.createElement("div");
+  list.className = "hr-list";
+  for (const op of operations) list.appendChild(historyItem(op));
+  historyBody.appendChild(list);
+}
+
+function historyBanner() {
+  const banner = document.createElement("div");
+  banner.className = "hr-banner";
+  banner.textContent = HISTORY_BANNER;
+  return banner;
+}
+
+function historyBackButton() {
+  const back = document.createElement("button");
+  back.type = "button";
+  back.className = "hr-back";
+  back.textContent = "返回列表";
+  back.addEventListener("click", () => {
+    void refreshHistory();
+  });
+  return back;
+}
+
+function historyNotice(text) {
+  const d = document.createElement("div");
+  d.className = "hr-empty";
+  d.textContent = text;
+  return d;
+}
+
+/**
+ * 一行 = 一笔业务。
+ *
+ * ★ 这一行只讲**这一笔**的状态:标题用它自己的 family/subject,徽标用它自己的
+ *   statusLabel —— 不替同会话的其它业务发言,也不被它们盖住。
+ */
+function historyItem(op) {
+  const item = document.createElement("button");
+  item.type = "button";
+  item.className = op.isCurrent ? "hr-item active" : "hr-item";
+
+  const time = document.createElement("span");
+  time.className = "hr-time";
+  time.textContent = fmtHistoryTime(op.createdAt);
+
+  const title = document.createElement("span");
+  title.className = "hr-title";
+  title.textContent = operationTitle(op);
+
+  const status = document.createElement("span");
+  status.className = `hr-status ${op.tone}`;
+  status.textContent = op.statusLabel;
+
+  const sub = document.createElement("span");
+  sub.className = "hr-sub";
+  sub.textContent = [
+    fmtHistoryAmount(op.amount),
+    op.reference ? `流水号 …${String(op.reference).slice(-4)}` : "",
+    op.isCurrent ? "本次对话办的" : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  item.append(time, title, status, sub);
+  item.addEventListener("click", () => {
+    void openOperation(op);
+  });
+  return item;
+}
+
+/** 「转账汇款 · 王秀兰」:两个字段都是服务端给的,前端只做拼接(红线 #8) */
+function operationTitle(op) {
+  return [op.family, op.subject].filter(Boolean).join(" · ") || op.capability || "业务记录";
+}
+
+/** 金额:只格式化服务端给的真实数字,不做任何业务判断 */
+function fmtHistoryAmount(amount) {
+  if (typeof amount !== "number") return "";
+  return `¥${amount.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/** 点一行:看这一笔的详情 + 它所属那次对话的回放 */
+async function openOperation(op) {
+  /**
+   * ★ 能不能回放由服务端说了算(hasSession = 那次对话还在保留期内)。
+   *   不能回放时也不给客户一个点不动的行 —— 退回"只有这一笔"的详情。
+   */
+  const replayable = op.hasSession ?? Boolean(op.sessionId);
+  if (!replayable) {
+    await openLedgerEntry(op);
+    return;
+  }
+  await openSession(op.sessionId, op.opId);
+}
+
+/** 早于会话记录功能的台账条目:没有可回放的对话,只能看这一笔本身 */
+async function openLedgerEntry(op) {
+  historyBody.innerHTML = "";
+  if (!op.opId) {
+    historyBody.appendChild(historyNotice("这条记录没有可查看的详情。"));
+    historyBody.appendChild(historyBackButton());
+    return;
+  }
+  try {
+    const q = new URLSearchParams({ customerId: profile?.customerId ?? "" });
+    const data = await get(`/api/ledger/${encodeURIComponent(op.opId)}?${q.toString()}`);
+    renderLedgerEntry(data.operation);
+  } catch (err) {
+    historyBody.appendChild(historyNotice(`读取这条记录失败:${err.message}`));
+    historyBody.appendChild(historyBackButton());
+  }
+}
+
+/** 详情:只读回放(复用现有 renderText,不渲染任何操作按钮) */
+async function openSession(id, focusOpId) {
+  historyBody.innerHTML = "";
+  try {
+    const q = new URLSearchParams({ customerId: profile?.customerId ?? "" });
+    const data = await get(`/api/sessions/${encodeURIComponent(id)}?${q.toString()}`);
+    renderSession(data.session, focusOpId);
+  } catch (err) {
+    historyBody.appendChild(historyNotice(`读取这次对话失败:${err.message}`));
+    historyBody.appendChild(historyBackButton());
+  }
+}
+
+function renderSession(s, focusOpId) {
+  const wrap = document.createElement("div");
+  wrap.className = "hr-detail";
+
+  wrap.appendChild(historyBanner());
+
+  const head = document.createElement("div");
+  head.className = "hr-detail-head";
+  const title = document.createElement("div");
+  title.className = "hr-detail-title";
+  title.textContent = s.title;
+  const meta = document.createElement("div");
+  meta.className = "hr-detail-meta";
+  meta.textContent = `${fmtHistoryTime(s.startedAt)} · ${s.statusLabel}`;
+  head.append(title, meta);
+  wrap.appendChild(head);
+
+  /**
+   * ★ 会话里的每一笔业务都列出来。
+   *
+   *   会话头的 statusLabel 是"本次对话最需要关注的一个",它是会话级口径;
+   *   而客户常常是**从某一笔点进来**的 —— 所以这里必须把同会话的其它几笔
+   *   一并摆出来,并把点进来的那一笔高亮,让他看清"这次一共办了几件、
+   *   哪一件是我刚点的、其余各自是什么状态"。
+   */
+  /**
+   * ★ 用 businesses(一笔业务一行),不用 operations(事件流水)。
+   *   事件流水里一笔转账是「待你确认」+「已转账成功」两行 ——
+   *   拿它数笔数会把一件事数成两件。两者都由服务端给,前端只挑该显示的那份。
+   */
+  const ops = s.businesses ?? s.operations ?? [];
+  if (ops.length > 0) {
+    const label = document.createElement("div");
+    label.className = "hr-ops-label";
+    label.textContent = `这次对话办了 ${ops.length} 笔业务`;
+    wrap.appendChild(label);
+    wrap.appendChild(renderOperations(ops, focusOpId));
+  }
+
+  const turns = document.createElement("div");
+  turns.className = "hr-turns";
+  for (const t of s.turns ?? []) {
+    const row = document.createElement("div");
+    row.className = `hr-turn ${t.role}`;
+
+    const role = document.createElement("div");
+    role.className = "hr-role";
+    role.textContent = t.role === "user" ? "您" : "助手";
+
+    const text = document.createElement("div");
+    text.className = "hr-turn-text";
+    text.appendChild(renderText(t.text));
+
+    row.append(role, text);
+
+    if (t.cardTitle) {
+      const card = document.createElement("div");
+      card.className = "hr-turn-card";
+      card.textContent = `卡片:${t.cardTitle}`;
+      row.appendChild(card);
+    }
+    turns.appendChild(row);
+  }
+  wrap.appendChild(turns);
+
+  /**
+   * ★ 这里只有两个按钮:"再办一次"与"返回列表"。
+   *   没有确认、没有取消、没有"继续办理" —— 历史不能办任何事。
+   */
+  const replay = document.createElement("button");
+  replay.type = "button";
+  replay.className = "hr-replay";
+  replay.textContent = "再办一次";
+  replay.addEventListener("click", () => replaySession(s));
+  wrap.appendChild(replay);
+
+  wrap.appendChild(historyBackButton());
+
+  historyBody.appendChild(wrap);
+}
+
+/**
+ * 台账条目的清单(会话详情里用,也用于没有会话可回放的老条目)。
+ * focusOpId 是客户点进来的那一笔 —— 只做视觉高亮,不改任何数据。
+ */
+function renderOperations(ops, focusOpId) {
+  const list = document.createElement("div");
+  list.className = "hr-ops";
+  for (const op of ops) {
+    const row = document.createElement("div");
+    row.className = op.opId && op.opId === focusOpId ? "hr-op active" : "hr-op";
+
+    const title = document.createElement("div");
+    title.className = "hr-op-title";
+    title.textContent = operationTitle(op);
+
+    const status = document.createElement("span");
+    status.className = `hr-status ${op.tone}`;
+    status.textContent = op.statusLabel;
+
+    const meta = document.createElement("div");
+    meta.className = "hr-op-meta";
+    meta.textContent = [
+      fmtHistoryTime(op.createdAt),
+      fmtHistoryAmount(op.amount),
+      op.reference ? `流水号 ${op.reference}` : "",
+      op.detail ?? "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+
+    row.append(title, status, meta);
+    list.appendChild(row);
+  }
+  return list;
+}
+
+/** 没有关联会话的老台账条目:只呈现这一笔本身(口径与详情页一致) */
+function renderLedgerEntry(op) {
+  const wrap = document.createElement("div");
+  wrap.className = "hr-detail";
+
+  wrap.appendChild(historyBanner());
+
+  const head = document.createElement("div");
+  head.className = "hr-detail-head";
+  const title = document.createElement("div");
+  title.className = "hr-detail-title";
+  title.textContent = operationTitle(op);
+  const meta = document.createElement("div");
+  meta.className = "hr-detail-meta";
+  meta.textContent = `${fmtHistoryTime(op.createdAt)} · ${op.statusLabel}`;
+  head.append(title, meta);
+  wrap.appendChild(head);
+
+  wrap.appendChild(renderOperations([op], op.opId));
+
+  const note = document.createElement("div");
+  note.className = "hr-empty";
+  note.textContent = "这条记录没有可回看的对话(早于会话回放功能,或那次对话已超过保留期)。下面是它自己的业务状态。";
+  wrap.appendChild(note);
+
+  wrap.appendChild(historyBackButton());
+
+  historyBody.appendChild(wrap);
+}
+
+/**
+ * 「再办一次」:换新会话 + 预填上一轮用户原话。
+ *
+ * ★ 为什么必须换 sessionId:旧会话里可能还挂着一笔待确认动作。
+ *   复用旧会话 = 把客户带回那个"还有一笔没处理"的状态,甚至让他以为
+ *   这次点的是新业务、实际确认的是旧待办。换一个新会话,旧待办原封不动。
+ *
+ * ★ 为什么用刷新页面而不是就地清空:sessionId 是页面加载时确定的常量,
+ *   就地改它会让"当前页面的对话"与"服务端认为的会话"错位。
+ *   刷新是最不容易出错的实现 —— 并且它天然把聊天区清成"新会话"。
+ */
+function replaySession(s) {
+  const lastUser = [...(s.turns ?? [])].reverse().find((t) => t.role === "user");
+  const fresh = `web_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  sessionStorage.setItem(SESSION_KEY, fresh);
+  if (lastUser?.text) sessionStorage.setItem(REPLAY_PREFILL_KEY, lastUser.text);
+  location.reload();
+}
+
+// ============================================================================
+// 审计面板
+// ============================================================================
+
+let auditTimer = null;
+
+async function openAudit() {
+  if (!paneHistory.hidden) closeHistory();
+  paneChat.hidden = true;
+  paneAudit.hidden = false;
+  composer.hidden = true;
+  btnBack.hidden = false;
+  appbarSub.textContent = "审计与安全";
+  await refreshAudit();
+  auditTimer = setInterval(refreshAudit, 4000);
+}
+
+function closeAudit() {
+  if (auditTimer) clearInterval(auditTimer);
+  auditTimer = null;
+  paneAudit.hidden = true;
+  paneChat.hidden = false;
+  composer.hidden = false;
+  btnBack.hidden = true;
+  appbarSub.textContent = "在线 · 支持转账 / 账单 / 理财 / 卡片";
+  scrollToEnd();
+}
+
+async function refreshAudit() {
+  try {
+    const [verify, recent] = await Promise.all([
+      get("/api/audit/verify"),
+      get("/api/audit/recent?limit=40"),
+    ]);
+    auditBody.innerHTML = "";
+
+    const hero = document.createElement("div");
+    hero.className = "audit-hero";
+    const title = document.createElement("div");
+    title.innerHTML = verify.intact
+      ? '哈希链校验:<span class="ok"><i class="ri-checkbox-circle-line" aria-hidden="true"></i>完整,未被篡改</span>'
+      : `哈希链校验:<span class="bad"><i class="ri-close-circle-line" aria-hidden="true"></i>断点位于 seq=${verify.brokenAtSeq}</span>`;
+    const meta = document.createElement("div");
+    meta.className = "audit-meta";
+    meta.textContent =
+      `事件总数 ${verify.total} · 每条哈希 = SHA256(seq|ts|type|payload|prevHash)。` +
+      "任何一条被修改、删除或插入,后续全链校验都会失败并精确定位断点。";
+    hero.append(title, meta);
+    auditBody.appendChild(hero);
+
+    const list = document.createElement("div");
+    list.className = "audit-list";
+    const events = [...(recent.events ?? [])].reverse();
+    for (const e of events) {
+      const ev = document.createElement("div");
+      ev.className = "audit-ev";
+      if (e.sessionId === sessionId) ev.classList.add("hl");
+
+      const top = document.createElement("div");
+      top.className = "audit-ev-top";
+      const type = document.createElement("span");
+      type.className = "audit-ev-type";
+      type.textContent = e.type;
+      const seq = document.createElement("span");
+      seq.className = "audit-ev-seq";
+      seq.textContent = `#${e.seq} · ${new Date(e.ts).toLocaleTimeString("zh-CN")}`;
+      top.append(type, seq);
+      ev.appendChild(top);
+
+      const hash = document.createElement("div");
+      hash.className = "audit-ev-hash";
+      hash.textContent = `${e.hashShort} ← ${e.prevHashShort}`;
+      ev.appendChild(hash);
+
+      list.appendChild(ev);
+    }
+    auditBody.appendChild(list);
+  } catch (err) {
+    auditBody.innerHTML = "";
+    const d = document.createElement("div");
+    d.className = "audit-hero";
+    d.textContent = `读取审计失败:${err.message}`;
+    auditBody.appendChild(d);
+  }
+}
+
+btnAudit.addEventListener("click", () => {
+  if (paneAudit.hidden) openAudit();
+  else closeAudit();
+});
+btnHistory.addEventListener("click", () => {
+  if (paneHistory.hidden) openHistory();
+  else closeHistory();
+});
+// 返回按钮按"当前在哪个面板"决定退到哪 —— 历史与审计共用同一个返回位
+btnBack.addEventListener("click", () => {
+  if (!paneHistory.hidden) closeHistory();
+  else closeAudit();
+});
+
+// ============================================================================
+// 启动
+// ============================================================================
+
+async function boot() {
+  try {
+    profile = await get("/api/demo/profile");
+  } catch {
+    profile = null;
+  }
+
+  renderWelcome();
+  renderDrawer();
+  fillDrawerHead();
+  inputEl.focus();
+
+  // 「再办一次」后的预填:上一轮用户原话(读完即删,避免下次刷新又冒出来)
+  const prefill = sessionStorage.getItem(REPLAY_PREFILL_KEY);
+  if (prefill) {
+    sessionStorage.removeItem(REPLAY_PREFILL_KEY);
+    inputEl.value = prefill;
+    inputEl.focus();
+  }
+}
+
+boot();

@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      ★ 移动端适配的第一件事就是这个 viewport。
+        没有它,页面会被当成 980px 宽的桌面页缩放着显示 —— 字小到看不清,
+        而且任何"看起来像 App"的努力都会被那层缩放毁掉。
+        viewport-fit=cover 让页面能延伸到刘海与home 指示条区域(配合 safe-area)。
+    -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <!-- iOS 全屏与状态栏样式:模拟 App 而不是网页 -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="银行智能助手" />
+    <meta name="theme-color" content="#1d4ed8" />
+    <meta name="format-detection" content="telephone=no" />
+    <title>银行智能助手</title>
+    <!-- Remix Icon:本地化托管,避免外部 CDN 被拦截/网络不通导致图标不显示 -->
+    <link rel="stylesheet" href="/vendor/remixicon/remixicon.css?v=20261017" />
+    <!-- 版本号每次改动都要改:否则浏览器会继续用缓存里的旧 app.js/app.css -->
+    <link rel="stylesheet" href="/app.css?v=20261019a" />
+  </head>
+  <body>
+    <!--
+      桌面浏览器里显示成"手机外框",移动端则铺满整屏。
+      刻意不做成"网页 + 侧边栏",因为要演示的就是**App 内的交互**。
+    -->
+    <div class="stage">
+      <div class="device" id="device">
+        <!-- 状态栏:纯装饰,但对"像 App"这件事贡献很大 -->
+        <div class="statusbar" aria-hidden="true">
+          <span class="statusbar-time" id="clock">9:41</span>
+          <span class="statusbar-notch"></span>
+          <span class="statusbar-icons">
+            <svg viewBox="0 0 18 12" width="17" height="11" aria-hidden="true">
+              <rect x="0" y="8" width="3" height="4" rx="1" fill="currentColor" />
+              <rect x="4.5" y="5.5" width="3" height="6.5" rx="1" fill="currentColor" />
+              <rect x="9" y="3" width="3" height="9" rx="1" fill="currentColor" />
+              <rect x="13.5" y="0" width="3" height="12" rx="1" fill="currentColor" />
+            </svg>
+            <svg viewBox="0 0 16 12" width="15" height="11" aria-hidden="true">
+              <path
+                d="M8 10.6 1.2 4.4a9.6 9.6 0 0 1 13.6 0L8 10.6Z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span class="battery"><span class="battery-fill"></span></span>
+          </span>
+        </div>
+
+        <!-- App 顶栏 -->
+        <header class="appbar">
+          <button class="appbar-btn" id="btn-menu" aria-label="打开常用服务与账户">
+            <i class="ri-menu-2-line" aria-hidden="true"></i>
+          </button>
+          <button class="appbar-btn" id="btn-back" aria-label="返回" hidden>
+            <i class="ri-arrow-left-s-line" aria-hidden="true"></i>
+          </button>
+          <div class="appbar-title">
+            <span class="appbar-name">银行智能助手</span>
+            <span class="appbar-sub" id="appbar-sub">在线 · 支持转账 / 账单 / 理财 / 卡片</span>
+          </div>
+          <button class="appbar-btn" id="btn-history" aria-label="历史记录">
+            <i class="ri-history-line" aria-hidden="true"></i>
+          </button>
+          <button class="appbar-btn" id="btn-audit" aria-label="审计与安全">
+            <i class="ri-shield-check-line" aria-hidden="true"></i>
+          </button>
+        </header>
+
+        <!-- 对话区 -->
+        <main class="screen" id="screen">
+          <section class="pane" id="pane-chat" aria-label="对话">
+            <div class="messages" id="messages"></div>
+          </section>
+
+          <!--
+            历史记录:只有"看"。
+            详情里没有任何确认/取消按钮 —— 服务端也不返回 pendingId,
+            所以界面即使被改也拿不到可执行的对象(能看不能办)。
+          -->
+          <section class="pane" id="pane-history" hidden aria-label="历史记录">
+            <div class="hr-wrap" id="history-body"></div>
+          </section>
+
+          <section class="pane" id="pane-audit" hidden aria-label="审计与安全">
+            <div class="audit" id="audit-body"></div>
+          </section>
+        </main>
+
+        <!-- 输入区 -->
+        <footer class="composer" id="composer">
+          <form class="inputbar" id="form" autocomplete="off">
+            <input
+              class="input"
+              id="input"
+              type="text"
+              placeholder="说点什么,例如「我有哪些卡」"
+              enterkeyhint="send"
+              autocomplete="off"
+              autocorrect="off"
+              spellcheck="false"
+            />
+            <button class="send" id="send" type="submit" aria-label="发送">
+              <i class="ri-send-plane-fill" aria-hidden="true"></i>
+            </button>
+          </form>
+          <div class="home-indicator" aria-hidden="true"></div>
+        </footer>
+
+        <!--
+          左侧模态抽屉:常用服务 / 我的常用流程 / 我的卡片 / 账户概览。
+          平时收起来,点顶栏左上角按钮或遮罩滑出/收回 —— 对话区只留对话本身。
+        -->
+        <div class="drawer-mask" id="drawer-mask" hidden>
+          <aside class="drawer" role="dialog" aria-label="常用服务与账户概览">
+            <div class="drawer-head">
+              <div class="drawer-user">
+                <div class="drawer-av"><i class="ri-user-3-line" aria-hidden="true"></i></div>
+                <div class="drawer-uinfo">
+                  <div class="drawer-name" id="drawer-name">—</div>
+                  <div class="drawer-sub" id="drawer-sub">总资产 —</div>
+                </div>
+              </div>
+              <button class="appbar-btn" id="btn-drawer-close" aria-label="关闭抽屉">
+                <i class="ri-close-line" aria-hidden="true"></i>
+              </button>
+            </div>
+            <div class="drawer-body" id="drawer-body"></div>
+          </aside>
+        </div>
+      </div>
+
+      <aside class="sidenote">
+        <h1>手机银行 App 入口</h1>
+        <ul>
+          <li><b>右侧对话</b>:直接用自然语言提需求</li>
+          <li><b>左上抽屉</b>:常用服务 / 我的卡片 / 账户概览</li>
+          <li><b>强验证</b>:遇到人脸识别时会弹出模拟验证条</li>
+          <li><b>时钟按钮</b>:历史会话列表与只读回放(能看不能办)</li>
+          <li><b>盾牌按钮</b>:看审计链与本次会话的裁决明细</li>
+        </ul>
+        <p class="sidenote-dim">手机浏览器打开即为全屏 App 形态。</p>
+      </aside>
+    </div>
+
+    <script type="module" src="/app.js?v=20261019a"></script>
+  </body>
+</html>
