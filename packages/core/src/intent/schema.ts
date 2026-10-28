@@ -62,6 +62,7 @@ export const INTENT_ACTIONS = [
   "account.recurring", // 定期支出/订阅识别
   "account.cashflow", // 收支/现金流分析
   "account.insights", // 综合账单洞察
+  "account.health_label", // 近几个月财务健康标签
   /**
    * ★ 预算规划(场景二的延伸)。
    *
@@ -116,6 +117,11 @@ export const INTENT_ACTIONS = [
    *   独立成动作之后,签署与申购各自留痕、各自可检索。
    */
   "wealth.sign_consent",
+  /**
+   * 到期续接方案。只读。
+   * 「续接第N个 / 不续投」也落在这个动作上,由路由层改去登记选择,不直接申购。
+   */
+  "wealth.rollover_plan",
 
   // --- 卡片管理(场景四)---
   /**

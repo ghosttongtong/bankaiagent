@@ -735,6 +735,23 @@ export interface BankPort {
   getWealthProduct(productCode: string): Promise<WealthProduct | null>;
   /** 客户的理财持仓(含市值与累计收益) */
   listWealthHoldings(customerId: string): Promise<WealthHolding[]>;
+  /** 活期挂牌利率。续接方案里的「不续投」对照只用这个数,不得改写成预计收益 */
+  getDemandDepositRate(customerId: string): Promise<DemandDepositRate>;
+  /** 记下续接选择。同一持仓只保留最新一条;不冻结资金、不创建申购 */
+  saveRolloverChoice(input: {
+    customerId: string;
+    planId: string;
+    holdingId: string;
+    decision: WealthRolloverChoice["decision"];
+    productCode: string | null;
+    productName: string | null;
+    amountBasis: number;
+    status: WealthRolloverChoice["status"];
+    gate: string;
+    note: string;
+  }): Promise<WealthRolloverChoice>;
+  /** 该持仓上最新的续接选择;没有则 null */
+  getRolloverChoice(customerId: string, holdingId: string): Promise<WealthRolloverChoice | null>;
   /** 客户的风险测评状态 */
   getRiskProfile(customerId: string): Promise<WealthRiskProfile>;
   /** 提交风险测评结果(问卷打分在能力层完成,此处只落库) */
@@ -1212,6 +1229,60 @@ export interface WealthProduct {
   riskDisclosure: string;
   /** 一句话产品特征(用于推荐时的客观描述) */
   highlight: string;
+  /**
+   * 近 6 个月最大回撤。
+   *
+   * ★ 没有这个字段就当「未披露」,调用方不得用 highlight 里的散文补一个数。
+   *   窗口、算法、截止日必须一起出现,否则一个百分比没有可比性。
+   */
+  maxDrawdown6m?: MaxDrawdown6m | null;
+}
+
+/** 近 6 个月最大回撤(银行侧事实,不是模型估算) */
+export interface MaxDrawdown6m {
+  /** 回撤幅度,百分比点数。1.2 表示 1.20%,不是「最多只会亏 1.2%」 */
+  pct: number;
+  windowStart: number;
+  windowEnd: number;
+  /** 计算方法原文,例如「区间内复权净值从峰值到谷值的最大跌幅」 */
+  method: string;
+  asOf: number;
+}
+
+/** 到期后资金怎么走。必须来自持仓,不能默认成「掉进活期」 */
+export type MaturityDisposition = "to_demand" | "auto_rollover" | "customer_instruction";
+
+/** 人民币活期存款挂牌利率。和理财业绩分列,禁止合成「预计年化」 */
+export interface DemandDepositRate {
+  /** 年化百分数。0.2 表示 0.20% */
+  annualRatePct: number;
+  effectiveFrom: number;
+  accountTypeLabel: string;
+  asOf: number;
+  source: string;
+}
+
+/**
+ * 客户对一笔到期续接的选择。
+ *
+ * ★ 这不是申购。status 不会是 purchased。
+ *   资金仍在份额里时只能是 awaiting_credit;到账之后仍要再走申购确认。
+ */
+export interface WealthRolloverChoice {
+  choiceId: string;
+  customerId: string;
+  planId: string;
+  holdingId: string;
+  decision: "renew" | "stay_demand";
+  productCode: string | null;
+  productName: string | null;
+  /** 金额口径:生成方案时的市值,不是已冻结金额 */
+  amountBasis: number;
+  status: "awaiting_credit" | "ready_to_confirm" | "declined";
+  /** 资金闸门代码,便于审计检索为什么没有申购 */
+  gate: string;
+  createdAt: number;
+  note: string;
 }
 
 export interface WealthProductQuery {
@@ -1255,6 +1326,21 @@ export interface WealthHolding {
   settlement: SettlementCycle;
   /** 持有天数 */
   holdingDays: number;
+  /**
+   * 银行侧到期日。
+   *
+   * ★ 有固定期限的产品才有。不要用「首次申购日 + 期限」在调用方现算:
+   *   中途买入、提前到期、自动续期都会让那个加法说错日子。
+   *   没有这个字段,就不要给这笔持仓出续接方案。
+   */
+  maturityAt?: number | null;
+  /** 到期后的处置。缺省表示银行没给,方案里必须明说不知道 */
+  maturityDisposition?: MaturityDisposition | null;
+  /**
+   * 银行是否已经把到期资金记入活期。
+   * 只有这个标记为真,才允许进入申购确认。份额还在、或标记未到,都不能买。
+   */
+  maturityCredited?: boolean;
 }
 
 /** 客户风险承受能力测评状态 */
@@ -2108,6 +2194,19 @@ export interface AuditEvent {
     | "wealth_consent_signed"
     | "wealth_consent_rejected"
     | "wealth_risk_disclosure_sent"
+    /**
+     * 到期续接方案已生成。
+     *
+     * ★ payload 里必须有 executed: false。
+     *   监管和客诉要能直接查出:系统展示过哪些候选、排除了谁、有没有趁机申购。
+     */
+    | "wealth_rollover_plan_generated"
+    /**
+     * 客户选定了续接或明确不续投。
+     *
+     * ★ 这是意思表示,不是成交。没有对应的申购事件,就说明钱没动。
+     */
+    | "wealth_rollover_choice_recorded"
     /**
      * ★ 卡片管理场景专用事件(场景四)。
      *

@@ -137,7 +137,12 @@ import {
   checkSuitability,
   computeRedemption,
   detectGuaranteeClaim,
+  detectYieldGapClaim,
+  evaluateRolloverFunds,
+  buildRolloverPlan,
   findProducts,
+  parseRolloverChoice,
+  rolloverFollowUps,
   scanProductsInText,
   fmtMoney,
   normalizeReturnWording,
@@ -278,6 +283,10 @@ export interface OrchestratorDeps {
     savedFlows: SuggestionFacts["savedFlows"];
     recentCapabilities: string[];
     wealthAssessed: boolean;
+    /** 最近一笔有银行侧到期日的持仓,还要几天到期。没有则为 null */
+    soonestMaturityDays?: number | null;
+    billHealth?: SuggestionFacts["billHealth"];
+    idleCash?: SuggestionFacts["idleCash"];
   }>;
 
   /** 历史记录写不进去不影响业务(个性化建议是体验增强) */
@@ -428,6 +437,18 @@ export class PendingActionStore {
 
   get(pendingId: string): PendingAction | undefined {
     return this.actions.get(pendingId);
+  }
+
+  /**
+   * 该客户当前全部未过期待确认动作(最近到期的在前)。
+   *
+   * ★ 纯查询:不清过期、不改状态。办事台用它列出"还等着您"的事,
+   *   不能只拿 latestFor 的一条 —— 客户可能同时挂着转账和理财两笔。
+   */
+  listFor(customerId: string, now: number): PendingAction[] {
+    return [...this.actions.values()]
+      .filter((a) => a.customerId === customerId && a.expiresAt > now)
+      .sort((a, b) => a.expiresAt - b.expiresAt);
   }
 
   /** 取最近一个未过期的待确认动作(用户直接回复"确认"时用) */
@@ -1050,7 +1071,24 @@ export class AgentOrchestrator {
    */
   private readonly lastWealthListBySession = new Map<
     string,
-    { items: Array<{ productCode: string; productName: string }>; at: number }
+    {
+      items: Array<{ productCode: string; productName: string }>;
+      at: number;
+      /** rollover: 这份编号来自到期续接方案,按序号申购必须改走「只登记选择」 */
+      origin?: "catalog" | "rollover";
+    }
+  >();
+
+  /** 刚刚看过的到期续接方案。选择只能落在这份快照上 */
+  private readonly lastRolloverPlanBySession = new Map<
+    string,
+    {
+      at: number;
+      planId: string;
+      holdingId: string;
+      productName: string;
+      candidates: Array<{ productCode: string; name: string }>;
+    }
   >();
 
   /** 最近一次对比所涉及的产品(供「这两个」这类无序号指代使用) */
@@ -1454,6 +1492,9 @@ export class AgentOrchestrator {
       recentCapabilities: base.recentCapabilities,
       sessionCapabilities,
       wealthAssessed: base.wealthAssessed,
+      ...(base.soonestMaturityDays !== undefined ? { soonestMaturityDays: base.soonestMaturityDays } : {}),
+      ...(base.billHealth !== undefined ? { billHealth: base.billHealth } : {}),
+      ...(base.idleCash !== undefined ? { idleCash: base.idleCash } : {}),
     };
   }
 
@@ -1831,8 +1872,11 @@ export class AgentOrchestrator {
       const askingAmount = this.slotFills.get(ctx.sessionId, ctx.now)?.asking === "amount";
       const askingWhichProduct =
         (this.choices.get(ctx.sessionId, ctx.now)?.options.length ?? 0) > 0;
+      // 刚问过「转给哪个张伟」时,「2」是在选人,不是在看理财列表的第 2 只。
+      const answeringPayee =
+        (this.clarifications.get(ctx.sessionId, ctx.now)?.candidates.length ?? 0) > 0;
       const looksLikeQuantity = /[个只支款种]/.test(userText);
-      const hasNarrowerState = askingWhichProduct || (askingAmount && !looksLikeQuantity);
+      const hasNarrowerState = askingWhichProduct || answeringPayee || (askingAmount && !looksLikeQuantity);
       if (shown && shown.length > 0 && !hasNarrowerState) {
         return this.finishRouted(
           await this.routeWealth({
@@ -1861,6 +1905,7 @@ export class AgentOrchestrator {
         rememberedCards &&
         rememberedCards.length > 1 &&
         !askingWhichProduct &&
+        !answeringPayee &&
         !(askingAmount && !looksLikeQuantity)
       ) {
         const refs = extractOrdinalRefs(userText);
@@ -2059,7 +2104,11 @@ export class AgentOrchestrator {
     {
       const pendingBuy = this.pendingWealthPurchaseBySession.get(ctx.sessionId);
       const pendingBuyFresh = pendingBuy && ctx.now - pendingBuy.at <= 30 * 60 * 1000;
-      const narrower = pendingForUser != null || slotFillActive;
+      const narrower =
+        pendingForUser != null ||
+        slotFillActive ||
+        choiceForUser != null ||
+        clarificationForUser != null;
       if (pendingBuyFresh && !narrower) {
         const bareAmount = extractAmountFromText(userText);
         const isBareAmountOnly =
@@ -3524,6 +3573,7 @@ export class AgentOrchestrator {
         capability: routed.capability,
         input: injected.input,
         policySummary: allReasons,
+        ...(routed.followUpNote ? { followUpNote: routed.followUpNote } : {}),
       });
     }
 
@@ -4042,6 +4092,8 @@ export class AgentOrchestrator {
       });
 
       if (first.candidates.length > 0) {
+        // 选择要能写回这一步,计划必须先留在会话里。否则用户回「2」时计划已经不在了。
+        this.plans.set(ctx.sessionId, plan);
         const options = first.candidates.map((c) => ({
           id: c.id,
           label: c.name,
@@ -4569,7 +4621,15 @@ export class AgentOrchestrator {
       const step = plan.steps.find((s) => s.nodeId === result.awaiting!.nodeId)!;
       const pending = this.pendingForThisTurn(ctx);
       narrative.push("");
-      narrative.push(`计划暂停于第 ${plan.steps.indexOf(step) + 1} 步,等待您确认。`);
+      const stepNo = plan.steps.indexOf(step) + 1;
+      const finished = plan.steps.filter((s) => s.status === "succeeded");
+      if (finished.length > 0) {
+        narrative.push(`上一件已经办完:${finished.map((s) => s.label).join("；")}。`);
+        narrative.push(`接下来自动办第 ${stepNo} 件,不用您再提醒。`);
+      } else if (plan.steps.length > 1) {
+        narrative.push(`这批一共 ${plan.steps.length} 件。这一件确认后,我会自动接着办下一件。`);
+      }
+      narrative.push(`计划暂停于第 ${stepNo} 步,等待您确认。`);
       if (pending) {
         const card = buildConfirmCard(placeholderCapability(pending.capability), pending.input);
         narrative.push(renderCardAsText(card));
@@ -6772,6 +6832,7 @@ export class AgentOrchestrator {
         capability: RegisteredCapability;
         input: Record<string, unknown>;
         resolutionNote?: string;
+        followUpNote?: string;
         presentation?: ConfirmPresentation;
       }
     | { reply: RenderedReply; reasons: PolicyReason[] }
@@ -6868,6 +6929,8 @@ export class AgentOrchestrator {
         };
       case "account.insights":
         return { capability: this.deps.registry.mustGet("account.insights"), input: {} };
+      case "account.health_label":
+        return { capability: this.deps.registry.mustGet("account.health_label"), input: {} };
 
       // ---- 理财场景(场景三)----
       case "wealth.list_products":
@@ -6878,6 +6941,7 @@ export class AgentOrchestrator {
       case "wealth.redeem":
       case "wealth.holdings":
       case "wealth.sign_consent":
+      case "wealth.rollover_plan":
         return this.routeWealth(args);
 
       // ---- 卡片管理场景(场景四)----
@@ -7040,6 +7104,21 @@ export class AgentOrchestrator {
   }): Promise<RoutedResult> {
     const { intent, ctx } = args;
     const wealth = intent.wealth ?? {};
+
+    // ★ 续接口令先于位置指代。
+    //   「续接第2个」里有序号。若先走位置指代,它会被改成「看第2个的详情」,
+    //   客户以为自己选定了,系统却只打开了一页说明书。
+    if (/(按续接方案申购|确认续接申购)/.test(args.envelope.text)) {
+      return this.routeRolloverPurchase(args);
+    }
+    if (/(为什么没放|没放进去|哪些没进|排除了哪些)/.test(args.envelope.text)) {
+      return this.routeRolloverExclusions(args);
+    }
+
+    const rolloverChoice = parseRolloverChoice(args.envelope.text);
+    if (rolloverChoice) {
+      return this.routeRolloverChoice(args, rolloverChoice);
+    }
 
     // ★ 一个容易搞错的分支:「赎回要多久到账」问的是**规则**,不是**执行赎回**。
     //   如果按字面走赎回流程,用户会被要求"指明赎回哪一只" ——
@@ -7466,6 +7545,13 @@ export class AgentOrchestrator {
       case "wealth.redeem":
         return this.routeWealthRedeem(args);
 
+      // ---- 只读:到期续接方案 ----
+      case "wealth.rollover_plan":
+        return {
+          capability: this.deps.registry.mustGet("wealth.rollover_plan"),
+          input: {},
+        };
+
       // ---- 只读:持仓 ----
       case "wealth.holdings":
         return {
@@ -7487,6 +7573,211 @@ export class AgentOrchestrator {
   }
 
   /**
+   * 「为什么没放固收」只解释排除原因,不改列表、不申购。
+   */
+  private async routeRolloverExclusions(args: {
+    intent: Intent;
+    ctx: ExecutionContext;
+    traceId: string;
+    envelope: MessageEnvelope;
+  }): Promise<RoutedResult> {
+    const plan = this.lastRolloverPlanBySession.get(args.ctx.sessionId);
+    if (!plan || args.ctx.now - plan.at > 30 * 60 * 1000) {
+      return {
+        reply: {
+          text: "还没有一份仍有效的续接方案。请先说「看看这笔理财到期怎么续接」。",
+          promptFor: { kind: "none" },
+        },
+        reasons: [{ ruleId: "R-WEALTH-ROLLOVER-EXCLUDE-NO-PLAN", message: "没有续接方案,无法解释排除原因" }],
+      };
+    }
+    const [holdings, products, profile, rate] = await Promise.all([
+      args.ctx.bank.listWealthHoldings(args.ctx.customerId),
+      args.ctx.bank.listWealthProducts({ limit: 20 }),
+      args.ctx.bank.getRiskProfile(args.ctx.customerId),
+      args.ctx.bank.getDemandDepositRate(args.ctx.customerId),
+    ]);
+    const built = buildRolloverPlan({
+      customerId: args.ctx.customerId,
+      holdings,
+      products,
+      profile,
+      rate,
+      now: args.ctx.now,
+    });
+    if (!built.ok || built.plan.planId !== plan.planId) {
+      return {
+        reply: {
+          text: "这份续接方案已经变了。请再说一次「看看这笔理财到期怎么续接」。",
+          promptFor: { kind: "none" },
+        },
+        reasons: [{ ruleId: "R-WEALTH-ROLLOVER-EXCLUDE-STALE", message: "续接方案已变,不解释旧的排除名单" }],
+      };
+    }
+    const named = args.envelope.text.match(/没放\s*([^\s,，。？?]{2,8})/);
+    const keyword = named?.[1]?.replace(/^(进去|了)/, "") ?? "";
+    const specific = keyword.length >= 2 && !/^(哪些|原因|产品|列表)/.test(keyword);
+    const hits = specific
+      ? built.plan.excluded.filter((e) => e.name.includes(keyword) || keyword.includes(e.name))
+      : [];
+    const lines: string[] = [];
+    if (hits.length > 0) {
+      for (const e of hits) lines.push(`${e.name}没进列表:${e.reason}。不是因为收益低。`);
+      const rest = built.plan.excluded.filter((e) => !hits.includes(e));
+      if (rest.length > 0) {
+        lines.push("其余没进列表的:");
+        for (const e of rest) lines.push(`· ${e.name}:${e.reason}`);
+      }
+    } else if (built.plan.excluded.length === 0) {
+      lines.push("这份方案没有被排除的在售产品。");
+    } else {
+      lines.push("没进列表的产品(不按收益淘汰):");
+      for (const e of built.plan.excluded) lines.push(`· ${e.name}:${e.reason}`);
+    }
+    lines.push("");
+    lines.push(rolloverFollowUps("browse"));
+    return {
+      reply: { text: lines.join("\n"), promptFor: { kind: "none" } },
+      reasons: [{ ruleId: "R-WEALTH-ROLLOVER-EXCLUDE", message: "解释续接方案的排除原因" }],
+    };
+  }
+
+  /**
+   * 入账之后才把已记下的选择送进申购路由。
+   * 未入账、未选择、方案过期,都停在这里,不出确认卡。
+   */
+  private async routeRolloverPurchase(args: {
+    intent: Intent;
+    ctx: ExecutionContext;
+    traceId: string;
+    envelope: MessageEnvelope;
+  }): Promise<RoutedResult> {
+    const plan = this.lastRolloverPlanBySession.get(args.ctx.sessionId);
+    if (!plan || args.ctx.now - plan.at > 30 * 60 * 1000) {
+      return {
+        reply: {
+          text: "这个会话里没有一份仍有效的续接方案。请先说「看看这笔理财到期怎么续接」。我没有申购。",
+          promptFor: { kind: "none" },
+        },
+        reasons: [{ ruleId: "R-WEALTH-ROLLOVER-PURCHASE-NO-PLAN", message: "没有有效续接方案,拒绝进入申购" }],
+      };
+    }
+    const choice = await args.ctx.bank.getRolloverChoice(args.ctx.customerId, plan.holdingId);
+    if (!choice || choice.decision !== "renew" || !choice.productCode) {
+      return {
+        reply: {
+          text: "还没有一笔续接选择。请先说「续接第1个」,或说「不续投」。我没有申购。",
+          promptFor: { kind: "none" },
+        },
+        reasons: [{ ruleId: "R-WEALTH-ROLLOVER-PURCHASE-NO-CHOICE", message: "没有续接选择,拒绝进入申购" }],
+      };
+    }
+    const [holdings, accounts] = await Promise.all([
+      args.ctx.bank.listWealthHoldings(args.ctx.customerId),
+      args.ctx.bank.listAccounts(args.ctx.customerId),
+    ]);
+    const holding = holdings.find((h) => h.holdingId === plan.holdingId);
+    if (!holding?.maturityAt) {
+      return {
+        reply: {
+          text: "这笔持仓没有银行侧到期日,不能按续接方案申购。",
+          promptFor: { kind: "none" },
+        },
+        reasons: [{ ruleId: "R-WEALTH-ROLLOVER-PURCHASE-NO-MATURITY", message: "持仓缺少到期日" }],
+      };
+    }
+    const available = accounts
+      .filter((a) => a.type === "current" || a.type === "savings")
+      .reduce((sum, a) => sum + a.availableBalance, 0);
+    const gate = evaluateRolloverFunds({
+      now: args.ctx.now,
+      maturityAt: holding.maturityAt,
+      disposition: holding.maturityDisposition,
+      credited: holding.maturityCredited === true,
+      availableBalance: available,
+      amount: choice.amountBasis,
+    });
+    if (!gate.ready) {
+      return {
+        reply: {
+          text: `${gate.message}\n没有申购。`,
+          promptFor: { kind: "none" },
+        },
+        reasons: [{ ruleId: "R-WEALTH-ROLLOVER-FUNDS", message: gate.message }],
+      };
+    }
+    return this.routeWealthPurchase({
+      ...args,
+      intent: {
+        ...args.intent,
+        action: "wealth.purchase",
+        amount: {
+          value: choice.amountBasis,
+          currency: "CNY",
+          raw: choice.amountBasis.toFixed(2),
+          derived: true,
+        },
+        wealth: {
+          ...(args.intent.wealth ?? {}),
+          productCode: choice.productCode,
+          ...(choice.productName ? { productName: choice.productName } : {}),
+        },
+      },
+    });
+  }
+
+  /**
+   * 把「续接第 N 个 / 不续投」落到刚刚那份方案上。
+   * 没有看过方案时,只生成方案,不把这句话当成已经选定。
+   */
+  private routeRolloverChoice(
+    args: { intent: Intent; ctx: ExecutionContext; traceId: string; envelope: MessageEnvelope },
+    choice: { kind: "stay_demand" } | { kind: "renew"; index: number },
+  ): RoutedResult {
+    const plan = this.lastRolloverPlanBySession.get(args.ctx.sessionId);
+    if (!plan || args.ctx.now - plan.at > 30 * 60 * 1000) {
+      return {
+        capability: this.deps.registry.mustGet("wealth.rollover_plan"),
+        input: {},
+        resolutionNote:
+          "还没有一份您看过、且仍在 30 分钟内的续接方案,所以这次只生成方案,没有登记选择,也没有申购。看完后请再说「续接第1个」或「不续投」。",
+      };
+    }
+    if (choice.kind === "renew") {
+      const candidate = plan.candidates[choice.index - 1];
+      if (!candidate) {
+        return {
+          reply: {
+            text: `这份方案里只有 ${plan.candidates.length} 只产品,没有第 ${choice.index} 个。我没有改选其他产品,也没有申购。`,
+            promptFor: { kind: "none" },
+          },
+          reasons: [{ ruleId: "R-WEALTH-ROLLOVER-ORDINAL", message: "续接序号超出方案" }],
+        };
+      }
+      return {
+        capability: this.deps.registry.mustGet("wealth.rollover_choose"),
+        input: {
+          planId: plan.planId,
+          holdingId: plan.holdingId,
+          decision: "renew",
+          productCode: candidate.productCode,
+          ordinal: choice.index,
+        },
+        resolutionNote: `按您看过的方案,续接第 ${choice.index} 个「${candidate.name}」。这一步只登记,不申购。`,
+      };
+    }
+    return {
+      capability: this.deps.registry.mustGet("wealth.rollover_choose"),
+      input: {
+        planId: plan.planId,
+        holdingId: plan.holdingId,
+        decision: "stay_demand",
+      },
+      resolutionNote: "按您看过的方案,记下不续投。没有申购。",
+    };
+  }
+
+  /**
    * ★ 申购路由:三道前置闸门都在这里。
    *
    * 设计要点:每道闸门给出的不是"失败",而是**下一步能做什么** ——
@@ -7503,6 +7794,33 @@ export class AgentOrchestrator {
     const { intent, ctx } = args;
     const wealth = intent.wealth ?? {};
     const text = args.envelope.text;
+
+    // ★ 编号来自续接方案时,「买第1个」不能走普通申购。
+    //   普通申购会立刻冻结活期可用余额,而到期资金这时还在份额里。
+    const shown = this.lastWealthListBySession.get(ctx.sessionId);
+    const rolloverList =
+      shown?.origin === "rollover" && ctx.now - shown.at < 30 * 60 * 1000 ? shown : null;
+    const namesOwnProduct =
+      Boolean(wealth.productCode) ||
+      Boolean(wealth.productName && wealth.productName.length >= 2 && !/^(这个|那个|它|第)/.test(wealth.productName));
+    if (rolloverList && !namesOwnProduct && /(买|申购|续接|就它|就这个|买这个)/.test(text)) {
+      const parsed = parseRolloverChoice(text);
+      const refs = wealth.ordinalRefs ?? extractOrdinalRefs(text);
+      const index = parsed?.kind === "renew" ? parsed.index : refs[0]?.indices[0];
+      if (parsed?.kind === "stay_demand") {
+        return this.routeRolloverChoice(args, parsed);
+      }
+      if (index) {
+        return this.routeRolloverChoice(args, { kind: "renew", index });
+      }
+      return {
+        reply: {
+          text: "这份编号来自到期续接方案。请说「续接第1个」这样的口令,或说「不续投」。我不会按「买一下」直接申购,那样会冻住活期里的其他钱。",
+          promptFor: { kind: "none" },
+        },
+        reasons: [{ ruleId: "R-WEALTH-ROLLOVER-NO-PURCHASE", message: "续接列表上的购买被改成登记选择" }],
+      };
+    }
 
     // ══════════════════════════════════════════════════════════════════════
     // ★★ 顺序:先确定"买哪只",再问"买多少"
@@ -8471,8 +8789,30 @@ export class AgentOrchestrator {
     if (
       capabilityName !== "wealth.list_products" &&
       capabilityName !== "wealth.compare" &&
-      capabilityName !== "wealth.product_detail"
+      capabilityName !== "wealth.product_detail" &&
+      capabilityName !== "wealth.rollover_plan"
     ) {
+      return;
+    }
+
+    if (capabilityName === "wealth.rollover_plan") {
+      const d = data as {
+        found?: boolean;
+        planId?: string | null;
+        holdingId?: string | null;
+        productName?: string | null;
+        products?: Array<{ productCode: string; name: string }>;
+      };
+      if (!d?.found || !d.planId || !d.holdingId || !d.products || d.products.length === 0) return;
+      const items = d.products.map((p) => ({ productCode: p.productCode, productName: p.name }));
+      this.lastWealthListBySession.set(sessionId, { items, at: now, origin: "rollover" });
+      this.lastRolloverPlanBySession.set(sessionId, {
+        at: now,
+        planId: d.planId,
+        holdingId: d.holdingId,
+        productName: d.productName ?? "",
+        candidates: d.products.map((p) => ({ productCode: p.productCode, name: p.name })),
+      });
       return;
     }
 
@@ -8504,7 +8844,7 @@ export class AgentOrchestrator {
       // ★ 带编号的列表:这是位置指代的**唯一**依据。
       const items = (d?.products ?? []).map((p) => ({ productCode: p.productCode, productName: p.name }));
       if (items.length === 0) return;
-      this.lastWealthListBySession.set(sessionId, { items, at: now });
+      this.lastWealthListBySession.set(sessionId, { items, at: now, origin: "catalog" });
       return;
     }
 
@@ -9978,6 +10318,18 @@ export class AgentOrchestrator {
   }
 
   /**
+   * 本会话仍在有效期内的联动方案。
+   *
+   * ★ 只读,给办事台用:过期一律当没有 —— 过期方案里的余额和扣款日不能再拿来办事。
+   *   不返回方案步骤的可执行载荷,调用方只应展示标题、摘要和剩余时间。
+   */
+  liveEventPlan(sessionId: string, now: number): EventPlan | null {
+    const remembered = this.lastEventPlanBySession.get(sessionId);
+    if (!remembered || remembered.plan.expiresAt <= now) return null;
+    return remembered.plan;
+  }
+
+  /**
    * 从方案里取出"客户说的那一步"。
    *
    * ★ 三条纪律,与订阅场景的序号解析完全同源:
@@ -10819,6 +11171,8 @@ export class AgentOrchestrator {
     input: Record<string, unknown>;
     policySummary: PolicyReason[];
     confirmedPayloadHash?: string;
+    /** 主路由的只读回复不走 settleCapabilityCall,附言要从这里补上 */
+    followUpNote?: string;
     /** 施加前言/附言的装饰器(见 settleCapabilityCall) */
     decorate?: (reply: RenderedReply) => RenderedReply;
   }): Promise<AgentTurnResult> {
@@ -10948,7 +11302,7 @@ export class AgentOrchestrator {
 
     const data = outcome.data as Record<string, unknown> | undefined;
 
-    const reply = renderExecutionResult({
+    const rendered = renderExecutionResult({
       capability: capability.name,
       ok: outcome.ok,
       ...(outcome.summary ? { summary: outcome.summary } : {}),
@@ -10957,6 +11311,10 @@ export class AgentOrchestrator {
       ...(typeof data?.["cancellableUntil"] === "number" ? { cancellableUntil: data["cancellableUntil"] as number } : {}),
       ...(typeof data?.["reference"] === "string" ? { reference: data["reference"] as string } : {}),
     });
+    const reply =
+      !args.decorate && args.followUpNote
+        ? { ...rendered, text: `${rendered.text}\n\n${args.followUpNote}` }
+        : rendered;
     // ★ 施加前言/附言。只读能力的回复同样可能有"我还欠用户一句说明"
     //   (最典型:测评完成后要接一句"你刚才那笔申购我记得")。
     const decoratedReply = args.decorate ? args.decorate(reply) : reply;
@@ -11808,16 +12166,18 @@ export class AgentOrchestrator {
    *   这里只做纯字段透传,不做任何计算 —— 数字计算的唯一来源是
    *   billAnalysis.ts 里的确定性函数(I3)。
    */
-  private buildBillQuery(intent: Intent, _userText: string): Record<string, unknown> {
+  private buildBillQuery(intent: Intent, userText: string): Record<string, unknown> {
     const q = intent.query ?? {};
 
     // 月度/年度周期类型:报告能力用
     let periodType: "monthly" | "annual" | undefined;
     if (/(年度|年报|今年|全年|去年|上一年)/.test(intent.restatedIntent)) periodType = "annual";
     else if (/(月度|月报|本月|这个月|上月|上个月)/.test(intent.restatedIntent)) periodType = "monthly";
+    const months = /近\s*三\s*个?\s*月|近\s*3\s*个?\s*月|这三个月/.test(userText) ? 3 : undefined;
 
     return {
       ...(periodType ? { periodType } : {}),
+      ...(months ? { months } : {}),
       ...(q.fromIso ? { fromIso: q.fromIso } : {}),
       ...(q.toIso ? { toIso: q.toIso } : {}),
     };
@@ -12712,8 +13072,22 @@ export function riskPreferenceKeyword(text: string): string {
 export function enforceWealthWording(text: string): { text: string; changed: string[] } {
   const changed: string[] = [];
   let out = text;
+  let strippedYieldGap = false;
 
-  // ① 违规承诺 → 按**整句**处理,而不是把命中的短语抠掉。
+  // ① 收益落差口号 → 整句删掉。必须早于「预计收益」改写,
+  //    否则「预计年化收益下降 2%」会被改成「业绩比较基准下降 2%」留在回复里。
+  const gapHits = detectYieldGapClaim(out);
+  if (gapHits.length > 0) {
+    strippedYieldGap = true;
+    changed.push(...gapHits);
+    out = out
+      .split(/(?<=[。;!?\n])/)
+      .filter((sentence) => detectYieldGapClaim(sentence).length === 0)
+      .join("")
+      .trim();
+  }
+
+  // ② 违规承诺 → 按**整句**处理,而不是把命中的短语抠掉。
   //
   // ★ 这里踩过一次坑,值得记下来:第一版是把命中的短语原地替换成
   //   "(不承诺保本保收益)",结果是产品自带的合规文案
@@ -12722,7 +13096,7 @@ export function enforceWealthWording(text: string): { text: string; changed: str
   //   语义完全颠倒,而且读起来像乱码。
   //   教训:"命中片段"与"承载它的句子"不是一回事。
   //   合规改写必须以**句子**为单位:整句改掉,语义边界才清楚。
-  const guaranteeHits = detectGuaranteeClaim(text);
+  const guaranteeHits = detectGuaranteeClaim(out);
   if (guaranteeHits.length > 0) {
     changed.push(...guaranteeHits);
     const kept = out
@@ -12740,11 +13114,14 @@ export function enforceWealthWording(text: string): { text: string; changed: str
 
   if (changed.length === 0) return { text, changed: [] };
 
+  const gapNote = strippedYieldGap
+    ? "活期挂牌利率和理财历史业绩不能相减后写成预计少拿多少。"
+    : "理财产品不得承诺保本保收益,收益口径只能是历史业绩或业绩比较基准。";
   return {
     text:
       `${NO_GUARANTEE_STATEMENT}\n\n${out}\n\n` +
       "(说明:上面的回复里原本有一句不合规的收益表述,系统已在发出前删改 —— " +
-      "理财产品不得承诺保本保收益,收益口径只能是历史业绩或业绩比较基准。)",
+      `${gapNote})`,
     changed: [...new Set(changed)],
   };
 }

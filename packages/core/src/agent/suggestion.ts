@@ -124,6 +124,63 @@ export function suggestWealthReview(facts: SuggestionFacts): ProactiveSuggestion
   };
 }
 
+/** 理财将在 7 天内到期:提一句续接方案,不提收益落差 */
+export function suggestWealthMaturity(facts: SuggestionFacts): ProactiveSuggestion | null {
+  const days = facts.soonestMaturityDays;
+  if (days == null || days < 0 || days > 7) return null;
+  const when = days <= 0 ? "今天到期" : `${days} 天后到期`;
+  return {
+    id: "wealth_maturity",
+    ruleId: "SUG-WEALTH-MATURITY",
+    text: `您有一笔理财${when}。要看同风险的续接方案吗?方案只比较,不会申购。`,
+    reason: `持仓上有银行侧到期日,且落在 7 天内(${when})。这时比较产品比事后提醒有用,但比较本身不动钱`,
+    say: "看看这笔理财到期怎么续接",
+    weight: 92,
+    origin: "rule",
+  };
+}
+
+function yuan(n: number): string {
+  return n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+/** 近几个月流水打出了三档之一:提一句,点开是同一份计算 */
+export function suggestBillHealth(facts: SuggestionFacts): ProactiveSuggestion | null {
+  const health = facts.billHealth;
+  if (!health || health.tag === "none") return null;
+  return {
+    id: "bill_health",
+    ruleId: "SUG-BILL-HEALTH",
+    text:
+      `${health.windowLabel}的财务健康标签是「${health.tagLabel}」。` +
+      `餐饮月均 ¥${yuan(health.diningMonthlyAvg)},月均结余 ¥${yuan(health.surplusMonthlyAvg)}。要看计算过程吗?`,
+    reason: health.reason,
+    say: "看看财务健康标签",
+    weight: 72,
+    origin: "rule",
+  };
+}
+
+/** 活期里有一笔达到门槛、且已经停留超过 48 小时的入账 */
+export function suggestIdleCash(facts: SuggestionFacts): ProactiveSuggestion | null {
+  const idle = facts.idleCash;
+  if (!idle) return null;
+  return {
+    id: "idle_cash",
+    ruleId: "SUG-IDLE-CASH",
+    text:
+      `${idle.atLabel}「${idle.counterpartyName}」入账 ¥${yuan(idle.amount)},已经 ${idle.ageHours} 小时。` +
+      `活期可用仍有 ¥${yuan(idle.demandAvailable)},不低于 ¥${yuan(idle.threshold)}。` +
+      `要看在售的货币类产品吗?货币基金不是存款,不保本。看产品不会申购。`,
+    reason:
+      `活期账户有单笔入账 ${idle.amount} 元,距今 ${idle.ageHours} 小时,超过 48 小时且未超过 30 天;` +
+      `活期可用 ${idle.demandAvailable} 元仍不低于门槛 ${idle.threshold} 元`,
+    say: "有哪些货币基金",
+    weight: 86,
+    origin: "rule",
+  };
+}
+
 /** 账单习惯:看过账单的人往往还想看异常 */
 export function suggestAnomalyCheck(facts: SuggestionFacts): ProactiveSuggestion | null {
   if (!facts.recentCapabilities.includes("account.report")) return null;
@@ -159,6 +216,9 @@ export const SUGGESTION_RULES: Array<(facts: SuggestionFacts) => ProactiveSugges
   suggestSaveAsFlow,
   suggestSavedFlow,
   suggestWealthReview,
+  suggestWealthMaturity,
+  suggestBillHealth,
+  suggestIdleCash,
   suggestAnomalyCheck,
 ];
 

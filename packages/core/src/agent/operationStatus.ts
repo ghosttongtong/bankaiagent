@@ -282,6 +282,32 @@ function capabilityStatus(capability: string, data: Record<string, unknown>): Op
       };
     }
 
+    case "wealth.rollover_plan":
+      return {
+        status: "inquiry",
+        label: "已生成到期续接方案 · 未申购",
+        detail: "方案只比较,没有冻结资金",
+        tone: "info",
+      };
+
+    case "wealth.rollover_choose": {
+      const decision = str(data["status"]);
+      if (decision === "declined") {
+        return {
+          status: "done",
+          label: "已记录不续投 · 未申购",
+          detail: "到期后按产品约定处理,没有冻结资金",
+          tone: "ok",
+        };
+      }
+      return {
+        status: "pending",
+        label: "已记下续接选择 · 到账前不会申购",
+        detail: "资金回到活期后仍须另行确认申购",
+        tone: "info",
+      };
+    }
+
     case "wealth.redeem": {
       const settlement = str(data["settlement"]);
       const arrival = num(data["estimatedArrivalAt"]);

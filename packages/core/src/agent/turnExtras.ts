@@ -206,7 +206,58 @@ export interface RetractionVisual {
   actions?: Array<{ label: string; say: string }>;
 }
 
-export type VisualBlock = DocDiffVisual | ReviewPlanVisual | RetractionVisual;
+/** 图上的一个柱。grouped 时 value2 是第二根(例如支出) */
+export interface BillChartPoint {
+  label: string;
+  value: number;
+  value2?: number;
+}
+
+/** 一张图:单列柱,或每月收入/支出两根柱 */
+export interface BillChartPanel {
+  title: string;
+  chart: "bars" | "grouped";
+  legend: string[];
+  series: BillChartPoint[];
+}
+
+/**
+ * 账单类图表。
+ *
+ * ★ 柱的高度只来自能力已经算好的数字,界面不重算。
+ *   notes 是这张图的数据说明,下载时和柱画在同一张图里。
+ */
+export interface BillChartVisual {
+  kind: "bill_chart";
+  title: string;
+  subtitle: string;
+  panels: BillChartPanel[];
+  notes: string[];
+  /** 下载文件名(含 .png) */
+  filename: string;
+}
+
+export type VisualBlock = DocDiffVisual | ReviewPlanVisual | RetractionVisual | BillChartVisual;
+
+/** 去掉空图,并收成安全文件名。没有可画的柱时返回 null。 */
+export function billChartVisual(input: Omit<BillChartVisual, "kind">): BillChartVisual | null {
+  const panels = input.panels
+    .map((panel) => ({
+      ...panel,
+      series: panel.series.filter((point) => Number.isFinite(point.value)),
+    }))
+    .filter((panel) => panel.series.length > 0);
+  if (panels.length === 0) return null;
+  const filename = `${input.filename.replace(/[\\/:*?"<>|]/g, "-").replace(/\.png$/i, "")}.png`;
+  return {
+    kind: "bill_chart",
+    title: input.title,
+    subtitle: input.subtitle,
+    panels,
+    notes: input.notes.map((note) => note.trim()).filter((note) => note.length > 0),
+    filename,
+  };
+}
 
 // ============================================================================
 // 常用流程模板
@@ -296,6 +347,35 @@ export interface SuggestionFacts {
   sessionCapabilities: string[];
   /** 客户是否已做过风险测评 */
   wealthAssessed: boolean;
+  /**
+   * 最近一笔带银行侧到期日的持仓,距离到期还有几天。
+   * 没有这种持仓时不传或为 null。建议规则不自己去推算到期日。
+   */
+  soonestMaturityDays?: number | null;
+  /**
+   * 近几个自然月的财务健康标签。没有流水时不传。
+   * 建议规则只读这份快照,不自己再算一遍。
+   */
+  billHealth?: {
+    tag: "dining_high" | "surplus_stable" | "spending_near_income" | "none";
+    tagLabel: string;
+    diningMonthlyAvg: number;
+    surplusMonthlyAvg: number;
+    windowLabel: string;
+    reason: string;
+  } | null;
+  /**
+   * 活期上停留超过 48 小时、金额达到门槛的最近一笔入账。
+   * 活期余额已经低于门槛时不传。
+   */
+  idleCash?: {
+    amount: number;
+    counterpartyName: string;
+    atLabel: string;
+    ageHours: number;
+    demandAvailable: number;
+    threshold: number;
+  } | null;
 }
 
 /**

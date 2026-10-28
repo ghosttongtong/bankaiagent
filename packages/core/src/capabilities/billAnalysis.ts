@@ -739,3 +739,273 @@ export function buildInsights(txs: Transaction[], now: number): InsightReport {
 
   return { insights, summary };
 }
+
+// ============================================================================
+// 财务健康标签 / 大额入账停留
+// ============================================================================
+
+/**
+ * 三档标签的门槛。全是相对客户自己的流水,没有同群比较。
+ * 调用方可以整份替换;演示用 DEFAULT。
+ */
+export interface BillHealthThresholds {
+  windowMonths: number;
+  diningCategory: string;
+  /** 餐饮支出 / 同期支出达到这个比例,记为餐饮偏高 */
+  diningShare: number;
+  /** 参与判断的每个月结余都达到这个金额,才可能记为结余稳定 */
+  stableMonthlySurplus: number;
+  /** 储蓄率(结余/收入)下限,与上一档同时满足 */
+  stableSavingsRate: number;
+  /** 支出 / 收入达到这个比例,记为支出接近收入 */
+  spendingToIncome: number;
+}
+
+export const DEFAULT_BILL_HEALTH_THRESHOLDS: BillHealthThresholds = {
+  windowMonths: 3,
+  diningCategory: "餐饮美食",
+  diningShare: 0.15,
+  stableMonthlySurplus: 3000,
+  stableSavingsRate: 0.1,
+  spendingToIncome: 0.9,
+};
+
+export type BillHealthTag = "dining_high" | "surplus_stable" | "spending_near_income" | "none";
+
+export interface BillHealthMonth {
+  label: string;
+  income: number;
+  expense: number;
+  net: number;
+  savingsRate: number | null;
+  dining: number;
+  diningCount: number;
+}
+
+export interface BillHealth {
+  tag: BillHealthTag;
+  tagLabel: string;
+  windowLabel: string;
+  months: BillHealthMonth[];
+  diningTotal: number;
+  diningCount: number;
+  diningMonthlyAvg: number;
+  diningShare: number | null;
+  incomeMonthlyAvg: number;
+  expenseMonthlyAvg: number;
+  surplusMonthlyAvg: number;
+  spendingToIncome: number | null;
+  thresholds: BillHealthThresholds;
+  /** 哪一条门槛被用上了,带上实际数字 */
+  reason: string;
+}
+
+const HEALTH_TAG_LABEL: Record<BillHealthTag, string> = {
+  dining_high: "餐饮偏高",
+  surplus_stable: "结余稳定",
+  spending_near_income: "支出接近收入",
+  none: "未达这三档",
+};
+
+function pct(ratio: number): string {
+  return `${Math.round(ratio * 1000) / 10}%`;
+}
+
+function yuanPlain(n: number): string {
+  return n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+/** 近 N 个自然月的财务健康标签。月份切分与收支分析同一套本地日历。 */
+export function buildBillHealth(
+  txs: Transaction[],
+  now: number,
+  thresholds: BillHealthThresholds = DEFAULT_BILL_HEALTH_THRESHOLDS,
+): BillHealth {
+  const windowMonths = Math.min(Math.max(thresholds.windowMonths, 2), 12);
+  const start = new Date(now);
+  start.setDate(1);
+  start.setHours(0, 0, 0, 0);
+  start.setMonth(start.getMonth() - (windowMonths - 1));
+
+  const months: BillHealthMonth[] = [];
+  for (let i = 0; i < windowMonths; i++) {
+    const from = new Date(start);
+    from.setMonth(start.getMonth() + i);
+    const to = new Date(from);
+    to.setMonth(from.getMonth() + 1);
+    const slice = txs.filter((t) => t.ts >= from.getTime() && t.ts < to.getTime());
+    const income = round2(slice.filter((t) => t.direction === "in").reduce((s, t) => s + t.amount, 0));
+    const expense = round2(slice.filter((t) => t.direction === "out").reduce((s, t) => s + t.amount, 0));
+    const diningRows = slice.filter((t) => t.direction === "out" && t.category === thresholds.diningCategory);
+    months.push({
+      label: fmtMonth(from.getTime()),
+      income,
+      expense,
+      net: round2(income - expense),
+      savingsRate: income > 0 ? Math.round(((income - expense) / income) * 1000) / 10 : null,
+      dining: round2(diningRows.reduce((s, t) => s + t.amount, 0)),
+      diningCount: diningRows.length,
+    });
+  }
+
+  const withFlow = months.filter((m) => m.income > 0 || m.expense > 0);
+  const n = withFlow.length;
+  const incomeTotal = round2(withFlow.reduce((s, m) => s + m.income, 0));
+  const expenseTotal = round2(withFlow.reduce((s, m) => s + m.expense, 0));
+  const diningTotal = round2(withFlow.reduce((s, m) => s + m.dining, 0));
+  const diningCount = withFlow.reduce((s, m) => s + m.diningCount, 0);
+  const diningShare = expenseTotal > 0 ? diningTotal / expenseTotal : null;
+  const spendingRatio = incomeTotal > 0 ? expenseTotal / incomeTotal : null;
+  const windowLabel = months.length > 0 ? `${months[0]!.label}至${months[months.length - 1]!.label}` : "";
+
+  const base = {
+    windowLabel,
+    months,
+    diningTotal,
+    diningCount,
+    diningMonthlyAvg: n > 0 ? round2(diningTotal / n) : 0,
+    diningShare,
+    incomeMonthlyAvg: n > 0 ? round2(incomeTotal / n) : 0,
+    expenseMonthlyAvg: n > 0 ? round2(expenseTotal / n) : 0,
+    surplusMonthlyAvg: n > 0 ? round2((incomeTotal - expenseTotal) / n) : 0,
+    spendingToIncome: spendingRatio,
+    thresholds: { ...thresholds, windowMonths },
+  };
+
+  if (n < 2) {
+    return {
+      ...base,
+      tag: "none",
+      tagLabel: HEALTH_TAG_LABEL.none,
+      reason: `近 ${windowMonths} 个自然月里只有 ${n} 个月有流水,不够打标签。`,
+    };
+  }
+
+  if (spendingRatio != null && spendingRatio >= thresholds.spendingToIncome) {
+    return {
+      ...base,
+      tag: "spending_near_income",
+      tagLabel: HEALTH_TAG_LABEL.spending_near_income,
+      reason:
+        `${windowLabel}支出 ${yuanPlain(expenseTotal)} 元,收入 ${yuanPlain(incomeTotal)} 元,` +
+        `支出是收入的 ${pct(spendingRatio)},达到配置的 ${pct(thresholds.spendingToIncome)}。`,
+    };
+  }
+
+  if (diningShare != null && diningShare >= thresholds.diningShare) {
+    return {
+      ...base,
+      tag: "dining_high",
+      tagLabel: HEALTH_TAG_LABEL.dining_high,
+      reason:
+        `${windowLabel}餐饮美食 ${yuanPlain(diningTotal)} 元(${diningCount} 笔),` +
+        `占支出 ${pct(diningShare)},达到配置的 ${pct(thresholds.diningShare)}。`,
+    };
+  }
+
+  const stable = withFlow.every(
+    (m) =>
+      m.income > 0 &&
+      m.net >= thresholds.stableMonthlySurplus &&
+      m.savingsRate != null &&
+      m.savingsRate >= thresholds.stableSavingsRate * 100,
+  );
+  if (stable) {
+    return {
+      ...base,
+      tag: "surplus_stable",
+      tagLabel: HEALTH_TAG_LABEL.surplus_stable,
+      reason:
+        `${windowLabel}每个有流水的月份结余都不低于 ${yuanPlain(thresholds.stableMonthlySurplus)} 元,` +
+        `储蓄率都不低于 ${pct(thresholds.stableSavingsRate)}。月均结余 ${yuanPlain(base.surplusMonthlyAvg)} 元。`,
+    };
+  }
+
+  return {
+    ...base,
+    tag: "none",
+    tagLabel: HEALTH_TAG_LABEL.none,
+    reason:
+      `${windowLabel}没有打上这三档:` +
+      `餐饮占比 ${diningShare == null ? "无从计算" : pct(diningShare)}(门槛 ${pct(thresholds.diningShare)}),` +
+      `支出/收入 ${spendingRatio == null ? "无从计算" : pct(spendingRatio)}(门槛 ${pct(thresholds.spendingToIncome)}),` +
+      `结余稳定需要各月结余不低于 ${yuanPlain(thresholds.stableMonthlySurplus)} 元且储蓄率不低于 ${pct(thresholds.stableSavingsRate)}。`,
+  };
+}
+
+/** 给客户看的标签说明。数字全部来自 buildBillHealth,这里只排版。 */
+export function renderBillHealth(health: BillHealth): string {
+  const lines = [
+    `财务健康标签(${health.windowLabel},${health.months.length} 个自然月)`,
+    `标签:${health.tagLabel}`,
+    `依据:${health.reason}`,
+    `餐饮美食月均 ${yuanPlain(health.diningMonthlyAvg)} 元,共 ${health.diningCount} 笔` +
+      (health.diningShare == null ? "" : `,占支出 ${pct(health.diningShare)}`),
+    `月均收入 ${yuanPlain(health.incomeMonthlyAvg)} 元 · 月均支出 ${yuanPlain(health.expenseMonthlyAvg)} 元 · 月均结余 ${yuanPlain(health.surplusMonthlyAvg)} 元`,
+    "",
+    "逐月:",
+  ];
+  for (const m of health.months) {
+    lines.push(
+      `  ${m.label}  收入 ${yuanPlain(m.income)} · 支出 ${yuanPlain(m.expense)} · 结余 ${m.net >= 0 ? "+" : ""}${yuanPlain(m.net)} · 餐饮 ${yuanPlain(m.dining)}`,
+    );
+  }
+  lines.push("");
+  lines.push("这是账单分类,没有创建定投,也没有申购。");
+  lines.push("接下来可以直接说:");
+  lines.push("1. 「近三个月餐饮花了多少」看餐饮流水合计");
+  lines.push("2. 「近三个月收支」看逐月收入和结余");
+  lines.push("3. 「有哪些货币基金」只看在售货币类产品,不会申购");
+  return lines.join("\n");
+}
+
+export interface IdleCashConfig {
+  /** 单笔入账达到这个金额才留意 */
+  threshold: number;
+  /** 入账后至少停这么久 */
+  minIdleMs: number;
+  /** 只看这么近的入账,更早的不再提 */
+  lookbackMs: number;
+}
+
+export const DEFAULT_IDLE_CASH: IdleCashConfig = {
+  threshold: 5000,
+  minIdleMs: 48 * 3600 * 1000,
+  lookbackMs: 30 * 24 * 3600 * 1000,
+};
+
+export interface IdleCashHit {
+  amount: number;
+  ts: number;
+  counterpartyName: string;
+  ageMs: number;
+  demandAvailable: number;
+  threshold: number;
+}
+
+/**
+ * 活期账户上,最近一笔达到门槛、且已经停了至少 minIdle、又没有超出回看窗口的入账。
+ * 活期可用余额低于门槛时不提:钱已经不在活期里了。
+ */
+export function findIdleDemandInflow(
+  inflows: Array<{ amount: number; ts: number; counterpartyName: string }>,
+  demandAvailable: number,
+  now: number,
+  config: IdleCashConfig = DEFAULT_IDLE_CASH,
+): IdleCashHit | null {
+  if (demandAvailable < config.threshold) return null;
+  const hit = inflows
+    .filter((t) => t.amount >= config.threshold)
+    .map((t) => ({ ...t, ageMs: now - t.ts }))
+    .filter((t) => t.ageMs >= config.minIdleMs && t.ageMs <= config.lookbackMs)
+    .sort((a, b) => b.ts - a.ts)[0];
+  if (!hit) return null;
+  return {
+    amount: round2(hit.amount),
+    ts: hit.ts,
+    counterpartyName: hit.counterpartyName,
+    ageMs: hit.ageMs,
+    demandAvailable: round2(demandAvailable),
+    threshold: config.threshold,
+  };
+}

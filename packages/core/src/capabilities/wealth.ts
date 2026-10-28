@@ -20,6 +20,9 @@
  */
 
 import type {
+  DemandDepositRate,
+  MaturityDisposition,
+  MaxDrawdown6m,
   ProductRiskLevel,
   RiskLevel,
   SettlementCycle,
@@ -1219,6 +1222,407 @@ export function normalizeReturnWording(text: string): { text: string; changed: s
     }
   }
   return { text: out, changed };
+}
+
+// ============================================================================
+// 八·补、到期续接方案(只读;选定也不等于申购)
+// ============================================================================
+
+const ROLLOVER_DAY_MS = 24 * 3600 * 1000;
+/** 方案只覆盖银行侧到期日落在这个窗口里的持仓 */
+export const ROLLOVER_WINDOW_MS = 30 * ROLLOVER_DAY_MS;
+/** 方案快照有效期。过期后净值、可售状态都可能变了,不能拿旧序号去登记选择 */
+export const ROLLOVER_PLAN_TTL_MS = 30 * 60 * 1000;
+
+export interface RolloverCandidateView {
+  productCode: string;
+  name: string;
+  riskLevel: ProductRiskLevel;
+  sameAsHolding: boolean;
+  termText: string;
+  minAmount: number;
+  settlementText: string;
+  yieldText: string;
+  drawdownText: string;
+}
+
+export interface RolloverExclusion {
+  productCode: string;
+  name: string;
+  reason: string;
+}
+
+export interface RolloverPlanView {
+  planId: string;
+  holdingId: string;
+  productCode: string;
+  productName: string;
+  riskLevel: ProductRiskLevel;
+  marketValue: number;
+  maturityAt: number;
+  daysUntil: number;
+  disposition: MaturityDisposition | null;
+  dispositionText: string;
+  /** 以后若申购,金额口径用的是这笔市值,而且现在并不冻结 */
+  amountBasis: number;
+  demandAnnualRatePct: number;
+  demandRateText: string;
+  sourceYieldText: string;
+  candidates: RolloverCandidateView[];
+  excluded: RolloverExclusion[];
+  /** 结构上恒为 false:生成方案不申购 */
+  executed: false;
+  summary: string;
+}
+
+export type RolloverPlanResult =
+  | { ok: true; plan: RolloverPlanView }
+  | { ok: false; summary: string };
+
+export type RolloverChoiceParse = { kind: "stay_demand" } | { kind: "renew"; index: number };
+
+export interface RolloverFundGate {
+  ready: boolean;
+  code: "awaiting_maturity" | "still_held" | "short_balance" | "auto_rollover" | "ready" | "unknown_disposition";
+  message: string;
+}
+
+function rolloverPlanKey(raw: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < raw.length; i++) {
+    h ^= raw.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return `RP-${(h >>> 0).toString(16).toUpperCase().padStart(8, "0")}`;
+}
+
+function ymd(ts: number): string {
+  const d = new Date(ts);
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${m}-${day}`;
+}
+
+function yuan(n: number): string {
+  return n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+export function drawdownText(d: MaxDrawdown6m | null | undefined): string {
+  if (d == null || !Number.isFinite(d.pct)) return "近 6 个月最大回撤:未披露";
+  return `近 6 个月最大回撤 ${d.pct.toFixed(2)}%`;
+}
+
+/** 单只详情里用:百分比、窗口、算法放在同一句 */
+export function drawdownDetail(d: MaxDrawdown6m | null | undefined): string {
+  if (d == null || !Number.isFinite(d.pct)) return "近 6 个月最大回撤:未披露";
+  return `近 6 个月最大回撤 ${d.pct.toFixed(2)}%(${ymd(d.windowStart)} 至 ${ymd(d.windowEnd)},${d.method})`;
+}
+
+/**
+ * 续接对话每轮结尾都给同一类口令。
+ * 客户看完要知道下一句说什么;这些口令都有对应的下一轮回答。
+ */
+export function rolloverFollowUps(stage: "browse" | "renew" | "stay"): string {
+  if (stage === "renew") {
+    return [
+      "接下来可以直接说:",
+      "1. 「第2个怎么样」再看一只",
+      "2. 「续接第2个」改选,现在仍不买",
+      "3. 「不续投」改成留在活期",
+    ].join("\n");
+  }
+  if (stage === "stay") {
+    return [
+      "接下来可以直接说:",
+      "1. 「续接第1个」改成续接,现在仍不买",
+      "2. 「第2个怎么样」再看一只",
+      "3. 「为什么没放固收」看没进列表的原因",
+    ].join("\n");
+  }
+  return [
+    "接下来可以直接说:",
+    "1. 「第2个怎么样」看期限、费率和回撤",
+    "2. 「第1个和第2个比一下」并排比较",
+    "3. 「为什么没放固收」看没进列表的原因",
+    "4. 「续接第1个」只登记,现在不买",
+    "5. 「不续投」到期后留在活期",
+  ].join("\n");
+}
+
+function dispositionText(d: MaturityDisposition | null | undefined): string {
+  if (d === "to_demand") return "到期后回到活期,不会自动买入下一只产品。";
+  if (d === "auto_rollover") return "到期后按原产品自动续期。什么都不做就会续上;要换产品,得先取消自动续期。";
+  if (d === "customer_instruction") return "到期后必须由您给出指令,否则按产品说明书处理。银行没有告诉我「什么都不做」的默认去向。";
+  return "银行没有给出到期后的资金去向,方案里不能把它说成会回到活期。";
+}
+
+function indexFromToken(token: string): number | null {
+  if (/^\d+$/.test(token)) {
+    const n = Number(token);
+    return n >= 1 && n <= 20 ? n : null;
+  }
+  const cn: Record<string, number> = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  if (token === "十") return 10;
+  if (token.length === 2 && token.startsWith("十")) {
+    const rest = cn[token[1] ?? ""];
+    return rest ? 10 + rest : null;
+  }
+  return cn[token] ?? null;
+}
+
+/**
+ * 「续接第2个」「不续投」是选择口令,不是申购口令。
+ * 光说「第2个」不算选择 —— 那只是在指列表里的一只产品。
+ */
+export function parseRolloverChoice(text: string): RolloverChoiceParse | null {
+  const renew = text.match(/续接\s*第?\s*([0-9一二两三四五六七八九十]+)/);
+  const renewTail = text.match(/第\s*([0-9一二两三四五六七八九十]+)\s*个?\s*续接/);
+  const token = renew?.[1] ?? renewTail?.[1];
+  if (token) {
+    const index = indexFromToken(token);
+    if (index) return { kind: "renew", index };
+  }
+  if (/(不续投|留在活期|放到活期|放在活期|不续了)/.test(text)) return { kind: "stay_demand" };
+  return null;
+}
+
+/**
+ * 资金还在份额里,或还没到到期日,就不能申购。
+ * 活期里另有余额也不行:那是别的钱,续接不能顺手冻走。
+ */
+export function evaluateRolloverFunds(input: {
+  now: number;
+  maturityAt: number;
+  disposition: MaturityDisposition | null | undefined;
+  /** 银行核心已经把到期资金记入活期 */
+  credited: boolean;
+  availableBalance: number;
+  amount: number;
+}): RolloverFundGate {
+  if (input.disposition == null) {
+    return {
+      ready: false,
+      code: "unknown_disposition",
+      message: "银行没有说明这笔到期后去哪,不能替您申购。",
+    };
+  }
+  if (input.disposition === "auto_rollover") {
+    return {
+      ready: false,
+      code: "auto_rollover",
+      message: "这笔到期后会自动续期。在取消自动续期之前,不能再申购另一只,否则可能变成两笔。",
+    };
+  }
+  if (input.now < input.maturityAt) {
+    const days = Math.ceil((input.maturityAt - input.now) / ROLLOVER_DAY_MS);
+    return {
+      ready: false,
+      code: "awaiting_maturity",
+      message: `还有 ${days} 天到期,钱还在这只产品里,现在不买。`,
+    };
+  }
+  if (!input.credited) {
+    return {
+      ready: false,
+      code: "still_held",
+      message: "银行还没把到期款记入活期,现在不买。",
+    };
+  }
+  if (!(input.availableBalance >= input.amount)) {
+    return {
+      ready: false,
+      code: "short_balance",
+      message: "到期资金还没有以足额回到可用余额,不能按续接方案申购。",
+    };
+  }
+  return {
+    ready: true,
+    code: "ready",
+    message: "到期款已回到活期。说「按续接方案申购」才进入确认,这句本身不买。",
+  };
+}
+
+function yieldBasisText(p: WealthProduct): string {
+  return yieldLabel(p);
+}
+
+/**
+ * 选出不高于 min(原产品等级, 客户可买上限) 的在售产品。
+ * 不按收益排序。同一风险档里,期限更接近原产品的排前面。
+ */
+export function buildRolloverPlan(input: {
+  customerId: string;
+  holdings: WealthHolding[];
+  products: WealthProduct[];
+  profile: WealthRiskProfile;
+  rate: DemandDepositRate;
+  now: number;
+}): RolloverPlanResult {
+  const maturing = input.holdings
+    .filter((h) => h.maturityAt != null)
+    .filter((h) => {
+      const at = h.maturityAt!;
+      return at - input.now <= ROLLOVER_WINDOW_MS && input.now - at <= ROLLOVER_DAY_MS;
+    })
+    .sort((a, b) => a.maturityAt! - b.maturityAt!);
+
+  const holding = maturing[0];
+  if (!holding || holding.maturityAt == null) {
+    return {
+      ok: false,
+      summary:
+        "目前没有银行侧登记了到期日、且落在 30 天内的理财持仓。" +
+        "没有固定期限的产品不会出现在这里。我没有编一个到期日,也没有推荐产品。",
+    };
+  }
+
+  const source = input.products.find((p) => p.productCode === holding.productCode) ?? null;
+  const customerCap =
+    input.profile.assessed && !input.profile.expired && input.profile.maxProductRiskLevel
+      ? riskLevelOrdinal(input.profile.maxProductRiskLevel)
+      : null;
+  const sourceCap = riskLevelOrdinal(holding.riskLevel);
+  const cap = customerCap == null ? sourceCap : Math.min(customerCap, sourceCap);
+  const amount = holding.marketValue;
+
+  const excluded: RolloverExclusion[] = [];
+  const eligible: WealthProduct[] = [];
+  for (const p of input.products) {
+    if (p.status !== "on_sale") {
+      if (p.status === "suspended" || p.status === "sold_out") {
+        excluded.push({ productCode: p.productCode, name: p.name, reason: "当前不可申购" });
+      }
+      continue;
+    }
+    if (riskLevelOrdinal(p.riskLevel) > cap) {
+      excluded.push({
+        productCode: p.productCode,
+        name: p.name,
+        reason: `风险 ${p.riskLevel} 高于本次上限 R${cap}`,
+      });
+      continue;
+    }
+    if (p.minAmount > amount) {
+      excluded.push({
+        productCode: p.productCode,
+        name: p.name,
+        reason: `起购 ${yuan(p.minAmount)} 元,高于这笔到期市值 ${yuan(amount)} 元`,
+      });
+      continue;
+    }
+    eligible.push(p);
+  }
+
+  const sourceTerm = source?.termDays ?? null;
+  eligible.sort((a, b) => {
+    const riskD = (p: WealthProduct) => Math.abs(riskLevelOrdinal(p.riskLevel) - sourceCap);
+    const termD = (p: WealthProduct) => {
+      if (sourceTerm == null && p.termDays == null) return 0;
+      if (sourceTerm == null || p.termDays == null) return 10_000;
+      return Math.abs(p.termDays - sourceTerm);
+    };
+    return riskD(a) - riskD(b) || termD(a) - termD(b) || a.productCode.localeCompare(b.productCode);
+  });
+
+  const picked = eligible.slice(0, 3);
+  const candidates: RolloverCandidateView[] = picked.map((p) => ({
+    productCode: p.productCode,
+    name: p.name,
+    riskLevel: p.riskLevel,
+    sameAsHolding: p.productCode === holding.productCode,
+    termText: p.termDays == null ? "无固定期限" : termLabel(p),
+    minAmount: p.minAmount,
+    settlementText: p.settlement,
+    yieldText: yieldBasisText(p),
+    drawdownText: drawdownText(p.maxDrawdown6m),
+  }));
+
+  const daysUntil = Math.ceil((holding.maturityAt - input.now) / ROLLOVER_DAY_MS);
+  const disposition = holding.maturityDisposition ?? null;
+  const demandRateText =
+    `${input.rate.accountTypeLabel}挂牌年利率 ${input.rate.annualRatePct.toFixed(2)}%` +
+    `(生效日 ${ymd(input.rate.effectiveFrom)},来源:${input.rate.source})`;
+  const sourceYieldText = source ? yieldBasisText(source) : "原产品业绩口径未在目录中";
+  const planId = rolloverPlanKey(
+    [
+      input.customerId,
+      holding.holdingId,
+      String(holding.maturityAt),
+      amount.toFixed(2),
+      input.rate.annualRatePct.toFixed(4),
+      String(cap),
+      candidates.map((c) => c.productCode).join(","),
+    ].join("|"),
+  );
+
+  const when = daysUntil <= 0 ? "今天到期" : `${daysUntil} 天后到期`;
+  const lines: string[] = [];
+  lines.push(`到期续接方案 · ${holding.productName} ${when}(${ymd(holding.maturityAt)})`);
+  lines.push(
+    `市值约 ${yuan(holding.marketValue)} 元(估值)。${dispositionText(disposition)}只比较,不会申购,也不按收益排序,也不给综合最优。`,
+  );
+  if (maturing.length > 1) {
+    lines.push(`另有 ${maturing.length - 1} 笔也在 30 天内,这次只处理最近一笔。`);
+  }
+  lines.push("");
+  if (candidates.length === 0) {
+    lines.push("没有同时满足风险上限和起购金额的在售产品。");
+  }
+  candidates.forEach((c, i) => {
+    const same = c.sameAsHolding ? "(同一只,仍在售)" : "";
+    lines.push(`${i + 1}. ${c.name}${same} · ${c.riskLevel} · ${c.yieldText} · ${c.drawdownText} · ${c.termText}`);
+  });
+  lines.push("");
+  lines.push(`不续投:${demandRateText}。原产品:${sourceYieldText}。口径不同,不能相减。`);
+  if (customerCap == null) {
+    lines.push("您还没完成风险测评。真正申购时要先测评。");
+  }
+  lines.push(RISK_DISCLOSURE_STANDARD);
+  lines.push("");
+  lines.push(rolloverFollowUps("browse"));
+
+  const plan: RolloverPlanView = {
+    planId,
+    holdingId: holding.holdingId,
+    productCode: holding.productCode,
+    productName: holding.productName,
+    riskLevel: holding.riskLevel,
+    marketValue: holding.marketValue,
+    maturityAt: holding.maturityAt,
+    daysUntil,
+    disposition,
+    dispositionText: dispositionText(disposition),
+    amountBasis: amount,
+    demandAnnualRatePct: input.rate.annualRatePct,
+    demandRateText,
+    sourceYieldText,
+    candidates,
+    excluded,
+    executed: false,
+    summary: lines.join("\n"),
+  };
+  return { ok: true, plan };
+}
+
+/**
+ * 「预计年化下降 X%」这类落差口号。
+ * 活期利率和理财历史业绩不能相减后说成客户将少拿的钱。
+ */
+export const YIELD_GAP_PATTERNS: RegExp[] = [
+  /预计.{0,16}(下降|降低|少赚|落差)/,
+  /年化收益下降/,
+  /收益落差/,
+  /少赚/,
+  /转出至活期.{0,24}(下降|少)/,
+];
+
+export function detectYieldGapClaim(text: string): string[] {
+  const hits: string[] = [];
+  for (const p of YIELD_GAP_PATTERNS) {
+    const m = text.match(p);
+    if (m) hits.push(m[0]);
+  }
+  return [...new Set(hits)];
 }
 
 // ============================================================================

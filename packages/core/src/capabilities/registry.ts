@@ -32,14 +32,17 @@ import { isOperationCancelled } from "../policy/twoPhase.ts";
 import { cadenceLabel } from "./subscription.ts";
 import { transferFeeOf } from "./transferFee.ts";
 import { SOURCES, dayText, moneyText, monthRange } from "../agent/provenance.ts";
+import { billChartVisual } from "../agent/turnExtras.ts";
 import { compareDocuments } from "./documentCompare.ts";
 import {
+  buildBillHealth,
   buildCashflow,
   buildInsights,
   buildPeriodReport,
   detectAnomalies,
   detectRecurring,
   fmtDate,
+  renderBillHealth,
 } from "./billAnalysis.ts";
 import {
   ASSESSMENT_QUESTIONS,
@@ -50,8 +53,11 @@ import {
   RISK_LEVEL_LABELS,
   buildDisclosureSummary,
   buildRiskProfile,
+  buildRolloverPlan,
   checkSuitability,
+  drawdownDetail,
   compareProducts,
+  evaluateRolloverFunds,
   computePurchase,
   computeRedemption,
   detectGuaranteeClaim,
@@ -62,6 +68,7 @@ import {
   normalizeReturnWording,
   renderProductList,
   riskLevelOrdinal,
+  rolloverFollowUps,
   scoreAssessment,
   settlementLabel,
   termLabel,
@@ -547,6 +554,22 @@ export function registerReadCapabilities(registry: CapabilityRegistry): void {
           summaryParts.push(`变化最大的是${top.key}:${top.change > 0 ? "+" : ""}${top.change} 元`);
         }
       }
+
+      const spendingChart = billChartVisual({
+        title: categoryFilter ? `${categoryFilter}支出` : "支出结构",
+        subtitle: periodLabel,
+        filename: `支出分析-${periodLabel}`,
+        panels: [
+          {
+            title: categoryFilter ?? (groupBy === "counterparty" ? "按对手方" : groupBy === "month" ? "按月份" : "按分类"),
+            chart: "bars",
+            legend: ["金额(元)"],
+            series: groups.slice(0, 8).map((g) => ({ label: `${g.key} · ${g.count}笔`, value: g.total })),
+          },
+        ],
+        notes: [...summaryParts, `合计 ${grandTotal} 元。柱高与这段合计是同一批支出流水。`],
+      });
+      if (spendingChart && ctx.extras) ctx.extras.visual = spendingChart;
 
       return {
         ok: true,
@@ -1069,6 +1092,39 @@ export function registerBillAnalysisCapabilities(registry: CapabilityRegistry): 
       });
       if (ctx.extras) ctx.extras.hasMonetary = true;
 
+      const chart = billChartVisual({
+        title: `${periodType === "annual" ? "年度" : "月度"}账单报告`,
+        subtitle: report.periodLabel,
+        filename: `账单报告-${report.periodLabel}`,
+        panels: [
+          {
+            title: "收入与支出",
+            chart: "bars",
+            legend: ["金额(元)"],
+            series: [
+              { label: "收入", value: report.income },
+              { label: "支出", value: report.expense },
+            ],
+          },
+          {
+            title: "支出分类",
+            chart: "bars",
+            legend: ["金额(元)"],
+            series: report.topCategories.map((c) => ({
+              label: `${c.key} ${c.sharePct}%`,
+              value: c.total,
+            })),
+          },
+        ],
+        notes: [
+          report.summary,
+          report.comparison?.verdictText ?? "",
+          ...report.insights.slice(0, 4).map((item) => item.text),
+          "柱高与报告正文是同一份流水合计,下载的图里同时带有这些说明。",
+        ],
+      });
+      if (chart && ctx.extras) ctx.extras.visual = chart;
+
       return { ok: true, data: report, summary: lines.join("\n") };
     },
   });
@@ -1311,6 +1367,26 @@ export function registerBillAnalysisCapabilities(registry: CapabilityRegistry): 
         },
       });
 
+      const cashflowChart = billChartVisual({
+        title: `收支趋势(近 ${months} 个月)`,
+        subtitle: `近 ${months} 个月`,
+        filename: `收支趋势-近${months}个月`,
+        panels: [
+          {
+            title: "每月收入与支出",
+            chart: "grouped",
+            legend: ["收入", "支出"],
+            series: report.months.map((month) => ({
+              label: month.month,
+              value: month.income,
+              value2: month.expense,
+            })),
+          },
+        ],
+        notes: [report.summary, "蓝柱是收入,红柱是支出,与上面逐月数字是同一份结果。"],
+      });
+      if (cashflowChart && ctx.extras) ctx.extras.visual = cashflowChart;
+
       return { ok: true, data: report, summary: lines.join("\n") };
     },
   });
@@ -1371,6 +1447,79 @@ export function registerBillAnalysisCapabilities(registry: CapabilityRegistry): 
       return { ok: true, data: report, summary: lines.join("\n") };
     },
   });
+
+  // ---- 财务健康标签(近 3 个自然月,门槛可配置,数字只来自流水) ----
+  registry.register({
+    name: "account.health_label",
+    description:
+      "根据近几个自然月的收入、支出和餐饮分类,打一档财务健康标签:餐饮偏高、结余稳定、支出接近收入,或未达这三档。" +
+      "用户说『看看财务健康标签』『我的账单标签』时使用。只读。" +
+      "标签只比较客户自己的流水和配置门槛,不跟他人比,不推算定投,不申购。",
+    inputSchema: z.object({}),
+    outputSchema: z.object({
+      tag: z.string(),
+      tagLabel: z.string(),
+      diningMonthlyAvg: z.number(),
+      surplusMonthlyAvg: z.number(),
+      summary: z.string(),
+    }),
+    sideEffect: "none",
+    moneyMovement: false,
+    readOnly: true,
+    baseTier: "auto",
+    sensitiveFields: [],
+    monetaryFields: ["diningMonthlyAvg", "surplusMonthlyAvg"],
+    async execute(_input, ctx): Promise<CapabilityOutcome> {
+      const from = ctx.now - 100 * DAY;
+      const txs = await fetchWindow(ctx, from, ctx.now);
+      const health = buildBillHealth(txs, ctx.now);
+      const summary = renderBillHealth(health);
+
+      await ctx.audit.append({
+        ts: ctx.now,
+        traceId: ctx.traceId,
+        sessionId: ctx.sessionId,
+        customerId: ctx.customerId,
+        channel: ctx.channel,
+        type: "execution_completed",
+        payload: {
+          capability: "account.health_label",
+          tag: health.tag,
+          diningMonthlyAvg: health.diningMonthlyAvg,
+          surplusMonthlyAvg: health.surplusMonthlyAvg,
+          note: "财务健康标签由流水和配置门槛算出,未创建定投,未申购。",
+        },
+      });
+
+      ctx.extras?.citations.push({
+        id: "data:财务健康标签",
+        topic: `财务健康:${health.tagLabel}`,
+        source: SOURCES.bill,
+        subject: "客户本人 · 名下账户流水",
+        effective: health.windowLabel,
+        asOf: ctx.now,
+        calculation: [
+          `餐饮月均 = 窗口内餐饮美食支出 / 有流水的月份数 = ${health.diningMonthlyAvg.toFixed(2)} 元`,
+          `月均结余 = (收入 − 支出) / 有流水的月份数 = ${health.surplusMonthlyAvg.toFixed(2)} 元`,
+          health.reason,
+        ],
+        note: "门槛写在标签依据里。没有同群比较,没有把结余换成可投资金额。",
+        kind: "data",
+      });
+
+      return {
+        ok: true,
+        data: {
+          tag: health.tag,
+          tagLabel: health.tagLabel,
+          diningMonthlyAvg: health.diningMonthlyAvg,
+          surplusMonthlyAvg: health.surplusMonthlyAvg,
+          summary,
+        },
+        summary,
+      };
+    },
+  });
 }
 
 // ============================================================================
@@ -1394,6 +1543,8 @@ const ASSESSMENT_VALID_DAYS = 365;
  *     | wealth.compare        | none         | false         | auto     |
  *     | wealth.risk_assess    | none         | false         | auto     |
  *     | wealth.holdings       | none         | false         | auto     |
+ *     | wealth.rollover_plan  | none         | false         | auto     |
+ *     | wealth.rollover_choose| reversible   | false         | auto     |
  *     | wealth.purchase       | irreversible | true          | confirm  |
  *     | wealth.redeem         | irreversible | true          | confirm  |
  *
@@ -1686,6 +1837,7 @@ export function registerWealthCapabilities(registry: CapabilityRegistry): void {
       lines.push("");
       lines.push(`  · 风险等级:${product.riskLevel} ${PRODUCT_RISK_LABELS[product.riskLevel]}(${PRODUCT_TYPE_LABELS[product.type]})`);
       lines.push(`  · 收益参考:${yieldLabel(product)}`);
+      lines.push(`  · ${drawdownDetail(product.maxDrawdown6m)}`);
       lines.push(`  · 产品期限:${termLabel(product)}`);
       lines.push(`  · 起购金额:${product.minAmount.toLocaleString("zh-CN")} 元,递增单位 ${product.incrementAmount.toLocaleString("zh-CN")} 元`);
       lines.push(`  · 单位净值:${product.nav.toFixed(4)}`);
@@ -2601,6 +2753,293 @@ export function registerWealthCapabilities(registry: CapabilityRegistry): void {
       });
 
       return { ok: true, data: { ...receipt, riskDisclosure: product.riskDisclosure, summary: lines.join("\n") }, summary: lines.join("\n") };
+    },
+  });
+
+  // ---- 到期续接方案(只读:不申购、不冻结) ----
+  registry.register({
+    name: "wealth.rollover_plan",
+    description:
+      "为即将到期的理财持仓生成续接方案:同风险或更低风险的产品对比、近 6 个月最大回撤、不续投时的活期挂牌利率。" +
+      "用户说『理财快到期了怎么办』『看看这笔到期怎么续接』时使用。" +
+      "★ 只读。不排序出综合最优,不写预计收益下降,不申购,不冻结资金。",
+    inputSchema: z.object({}),
+    outputSchema: z.object({
+      found: z.boolean(),
+      planId: z.string().nullable(),
+      holdingId: z.string().nullable(),
+      productName: z.string().nullable(),
+      executed: z.boolean(),
+      marketValue: z.number().nullable(),
+      products: z.array(z.object({ productCode: z.string(), name: z.string() })),
+      summary: z.string(),
+    }),
+    sideEffect: "none",
+    moneyMovement: false,
+    readOnly: true,
+    baseTier: "auto",
+    sensitiveFields: [],
+    monetaryFields: ["marketValue"],
+    async execute(_input, ctx): Promise<CapabilityOutcome> {
+      const [holdings, products, profile, rate] = await Promise.all([
+        ctx.bank.listWealthHoldings(ctx.customerId),
+        ctx.bank.listWealthProducts({ limit: 20 }),
+        ctx.bank.getRiskProfile(ctx.customerId),
+        ctx.bank.getDemandDepositRate(ctx.customerId),
+      ]);
+      const built = buildRolloverPlan({
+        customerId: ctx.customerId,
+        holdings,
+        products,
+        profile,
+        rate,
+        now: ctx.now,
+      });
+      if (!built.ok) {
+        return {
+          ok: true,
+          data: {
+            found: false,
+            planId: null,
+            holdingId: null,
+            productName: null,
+            executed: false,
+            marketValue: null,
+            products: [],
+            summary: built.summary,
+          },
+          summary: built.summary,
+        };
+      }
+      const plan = built.plan;
+      ctx.extras?.citations.push({
+        id: "data:到期续接方案",
+        topic: `${plan.productName} 到期续接 · 市值与候选收益口径`,
+        source: SOURCES.wealth,
+        subject: `客户 ${ctx.customerId}`,
+        effective: `持仓市值与活期挂牌利率截至 ${new Date(ctx.now).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}`,
+        asOf: ctx.now,
+        calculation: [
+          `到期市值 ${plan.marketValue} 元 = 份额 × 最新净值`,
+          plan.demandRateText,
+          ...plan.candidates.map((c) => `${c.name} ${c.yieldText} · ${c.drawdownText}`),
+        ],
+        note: "方案不按收益排序。活期利率与理财业绩分列,不相减。",
+        kind: "data",
+      });
+      await ctx.audit.append({
+        ts: ctx.now,
+        traceId: ctx.traceId,
+        sessionId: ctx.sessionId,
+        customerId: ctx.customerId,
+        channel: ctx.channel,
+        type: "wealth_rollover_plan_generated",
+        payload: {
+          capability: "wealth.rollover_plan",
+          planId: plan.planId,
+          holdingId: plan.holdingId,
+          productCode: plan.productCode,
+          maturityAt: plan.maturityAt,
+          marketValue: plan.marketValue,
+          candidateCodes: plan.candidates.map((c) => c.productCode),
+          excluded: plan.excluded.slice(0, 6),
+          executed: false,
+          note: "续接方案只读。没有申购,没有冻结。候选不按收益排序。",
+        },
+      });
+      await ctx.audit.append({
+        ts: ctx.now,
+        traceId: ctx.traceId,
+        sessionId: ctx.sessionId,
+        customerId: ctx.customerId,
+        channel: ctx.channel,
+        type: "wealth_risk_disclosure_sent",
+        payload: {
+          capability: "wealth.rollover_plan",
+          productCount: plan.candidates.length,
+          riskLevels: [...new Set(plan.candidates.map((c) => c.riskLevel))],
+          disclosureIncluded: true,
+          customerRiskLevel: profile.level,
+          note: "续接方案随风险提示一起发出。",
+        },
+      });
+      return {
+        ok: true,
+        data: {
+          found: true,
+          planId: plan.planId,
+          holdingId: plan.holdingId,
+          productName: plan.productName,
+          executed: false,
+          marketValue: plan.marketValue,
+          products: plan.candidates.map((c) => ({ productCode: c.productCode, name: c.name })),
+          summary: plan.summary,
+        },
+        summary: plan.summary,
+      };
+    },
+  });
+
+  // ---- 登记续接选择(不申购) ----
+  registry.register({
+    name: "wealth.rollover_choose",
+    description:
+      "把客户对到期续接方案的选择记下来:续接某一只,或明确不续投。" +
+      "★ 不创建申购、不冻结资金。资金仍在原产品里时,状态只能是等待入账。" +
+      "用户说『续接第1个』『不续投』时使用,且必须对应刚刚看过的那份方案。",
+    inputSchema: z.object({
+      planId: z.string(),
+      holdingId: z.string(),
+      decision: z.enum(["renew", "stay_demand"]),
+      productCode: z.string().optional(),
+      ordinal: z.number().int().positive().optional(),
+    }),
+    outputSchema: z.object({
+      choiceId: z.string(),
+      status: z.string(),
+      gate: z.string(),
+      purchased: z.boolean(),
+      summary: z.string(),
+    }),
+    sideEffect: "reversible",
+    moneyMovement: false,
+    readOnly: false,
+    autoExecutable: true,
+    baseTier: "auto",
+    sensitiveFields: [],
+    monetaryFields: [],
+    async execute(input, ctx): Promise<CapabilityOutcome> {
+      const decision = input["decision"] === "stay_demand" ? "stay_demand" : "renew";
+      const planId = String(input["planId"] ?? "");
+      const holdingId = String(input["holdingId"] ?? "");
+      const productCode = typeof input["productCode"] === "string" ? input["productCode"] : "";
+
+      const [holdings, products, profile, rate, accounts] = await Promise.all([
+        ctx.bank.listWealthHoldings(ctx.customerId),
+        ctx.bank.listWealthProducts({ limit: 20 }),
+        ctx.bank.getRiskProfile(ctx.customerId),
+        ctx.bank.getDemandDepositRate(ctx.customerId),
+        ctx.bank.listAccounts(ctx.customerId),
+      ]);
+      const built = buildRolloverPlan({
+        customerId: ctx.customerId,
+        holdings,
+        products,
+        profile,
+        rate,
+        now: ctx.now,
+      });
+      if (!built.ok || built.plan.planId !== planId || built.plan.holdingId !== holdingId) {
+        return {
+          ok: false,
+          error: {
+            code: "ROLLOVER_PLAN_STALE",
+            message: "这份续接方案已经变了,或还没有一份您看过的方案。我没有登记选择,也没有申购。请先再说一次「看看这笔理财到期怎么续接」。",
+            retryable: true,
+          },
+        };
+      }
+      const plan = built.plan;
+      const holding = holdings.find((h) => h.holdingId === holdingId);
+      if (!holding) {
+        return {
+          ok: false,
+          error: { code: "HOLDING_GONE", message: "这笔持仓已经不在了,不能按旧方案续接。", retryable: false },
+        };
+      }
+
+      let chosenCode: string | null = null;
+      let chosenName: string | null = null;
+      if (decision === "renew") {
+        const candidate = plan.candidates.find((c) => c.productCode === productCode);
+        if (!candidate) {
+          return {
+            ok: false,
+            error: {
+              code: "ROLLOVER_CANDIDATE_MISSING",
+              message: "您选的产品不在刚才那份方案里。我没有改成别的产品,也没有申购。",
+              retryable: true,
+            },
+          };
+        }
+        chosenCode = candidate.productCode;
+        chosenName = candidate.name;
+      }
+
+      const available = accounts
+        .filter((a) => a.type === "current" || a.type === "savings")
+        .reduce((s, a) => s + a.availableBalance, 0);
+      const gate = evaluateRolloverFunds({
+        now: ctx.now,
+        maturityAt: plan.maturityAt,
+        disposition: holding.maturityDisposition,
+        credited: holding.maturityCredited === true,
+        availableBalance: available,
+        amount: plan.amountBasis,
+      });
+      const status = decision === "stay_demand" ? "declined" : gate.ready ? "ready_to_confirm" : "awaiting_credit";
+      const note =
+        decision === "stay_demand"
+          ? "客户明确不续投。没有申购,没有冻结。"
+          : gate.ready
+            ? "资金已回到活期。选择已记下,仍须客户另行确认申购。本次没有申购。"
+            : `${gate.message}本次没有申购,没有冻结。`;
+
+      const saved = await ctx.bank.saveRolloverChoice({
+        customerId: ctx.customerId,
+        planId,
+        holdingId,
+        decision,
+        productCode: chosenCode,
+        productName: chosenName,
+        amountBasis: plan.amountBasis,
+        status,
+        gate: decision === "stay_demand" ? "declined" : gate.code,
+        note,
+      });
+
+      await ctx.audit.append({
+        ts: ctx.now,
+        traceId: ctx.traceId,
+        sessionId: ctx.sessionId,
+        customerId: ctx.customerId,
+        channel: ctx.channel,
+        type: "wealth_rollover_choice_recorded",
+        payload: {
+          capability: "wealth.rollover_choose",
+          choiceId: saved.choiceId,
+          planId,
+          holdingId,
+          decision,
+          productCode: chosenCode,
+          status,
+          gate: saved.gate,
+          purchased: false,
+          amountBasis: plan.amountBasis,
+          note,
+        },
+      });
+
+      const head =
+        decision === "stay_demand"
+          ? `已记下:「${plan.productName}」到期后不续投。没有申购,现在没有冻结。`
+          : `已记下:续接「${chosenName}」。没有申购,现在没有冻结。`;
+      const when =
+        decision === "stay_demand" ? "" : gate.ready ? "到期款已回到活期。请再说「按续接方案申购」。" : gate.message;
+      const lines = [head, when, rolloverFollowUps(decision === "stay_demand" ? "stay" : "renew")].filter(
+        (line) => line.length > 0,
+      );
+      return {
+        ok: true,
+        data: {
+          choiceId: saved.choiceId,
+          status,
+          gate: saved.gate,
+          purchased: false,
+          summary: lines.join("\n"),
+        },
+        summary: lines.join("\n"),
+      };
     },
   });
 }

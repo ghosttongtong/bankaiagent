@@ -165,6 +165,7 @@ body {
   z-index: 5;
 }
 .appbar-btn {
+  position: relative;
   flex: 0 0 auto;
   width: 40px;
   height: 40px;
@@ -574,6 +575,68 @@ body {
 .quick button:active {
   background: var(--brand-soft);
   border-color: var(--brand-line);
+}
+.quick-more {
+  grid-column: 1 / -1;
+  flex-direction: row;
+  justify-content: center;
+  min-height: 34px;
+  border-style: dashed;
+  color: var(--text-dim);
+  font-size: 13px;
+  box-shadow: none;
+}
+.desk-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.desk-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 10px 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.desk-pending,
+.desk-plan {
+  border-color: var(--brand-line);
+  background: var(--brand-soft);
+}
+.desk-title {
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.45;
+  color: var(--text);
+}
+.desk-detail,
+.desk-why {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+.menu-badge {
+  position: absolute;
+  top: 4px;
+  right: 2px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 99px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+.menu-badge[hidden] {
+  display: none;
 }
 .quick .qi {
   width: 30px;
@@ -1244,6 +1307,108 @@ body {
   flex-direction: column;
   gap: 10px;
 }
+.chart-sub,
+.chart-notes p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+.bill-chart {
+  gap: 12px;
+}
+.chart-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--fill);
+}
+.chart-panel-title {
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text);
+}
+.chart-legend {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.chart-legend .lg::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 4px;
+  border-radius: 2px;
+  background: #1d4ed8;
+}
+.chart-legend .lg.out::before {
+  background: var(--danger);
+}
+.chart-legend .lg.inflow::before {
+  background: var(--ok);
+}
+.chart-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 6px;
+}
+.chart-row {
+  display: grid;
+  grid-template-columns: 92px 1fr;
+  gap: 8px;
+  align-items: center;
+}
+.chart-name {
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--text);
+  word-break: break-all;
+}
+.chart-tracks {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.chart-track {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.chart-bar {
+  display: block;
+  height: 8px;
+  border-radius: 99px;
+  background: #1d4ed8;
+  max-width: calc(100% - 78px);
+}
+.chart-bar.out {
+  background: var(--danger);
+}
+.chart-bar.inflow {
+  background: var(--ok);
+}
+.chart-num {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.chart-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
 .v-head {
   display: flex;
   align-items: center;
@@ -1310,6 +1475,7 @@ body {
   box-shadow: var(--shadow), inset 0 3px 0 var(--ok);
 }
 .v-action {
+  flex: 0 0 auto;
   font-family: inherit;
   font-size: 12.5px;
   color: var(--brand);
@@ -1861,6 +2027,51 @@ body {
   color: var(--warn);
   font-size: 12.5px;
   line-height: 1.55;
+}
+.thread-tags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 8px 12px 0;
+}
+.thread-tags[hidden] {
+  display: none;
+}
+.thread-tags-label,
+.thread-tag,
+.hr-filter {
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 1;
+  border-radius: 999px;
+}
+.thread-tags-label {
+  color: var(--text-faint);
+}
+.thread-tag,
+.hr-filter {
+  padding: 4px 8px;
+  color: var(--brand);
+  background: var(--brand-soft);
+  border: 1px solid var(--brand-line);
+}
+.hr-filters {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+.hr-filter {
+  font-family: inherit;
+  cursor: pointer;
+  background: var(--surface);
+  color: var(--text-dim);
+}
+.hr-filter.on {
+  color: var(--brand);
+  background: var(--brand-soft);
+  border-color: var(--brand-line);
 }
 .hr-list {
   display: flex;

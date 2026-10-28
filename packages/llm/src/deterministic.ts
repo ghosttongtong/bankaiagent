@@ -201,12 +201,22 @@ export function parseWithRules(
  */
 function splitMultiIntent(text: string, now: number): ParsedRequest["multiIntent"] {
   const hasSequence = /(先|首先|再|然后|接着|之后|最后|还要|顺便|另外)/.test(text) || /[;；]/.test(text);
-  if (!hasSequence) return undefined;
-
-  const clauses = text
-    .split(/(?:[;；])|(?:[,，]?\s*(?:先|首先|再|然后|接着|之后|最后|还要|顺便|另外)\s*)/)
-    .map((s) => s.replace(/^[,，。;；\s]+/, "").trim())
-    .filter((s) => s.length >= 3);
+  let clauses: string[] = [];
+  if (hasSequence) {
+    clauses = text
+      .split(/(?:[;；])|(?:[,，]?\s*(?:先|首先|再|然后|接着|之后|最后|还要|顺便|另外)\s*)/)
+      .map((s) => s.replace(/^[,，。;；\s]+/, "").trim())
+      .filter((s) => s.length >= 3);
+  }
+  // 「取消网易云会员和给张伟转1500」没有「再」,但左右是两件不同的事。
+  // 只有两边都能各自成事才拆开;「第1个和第2个比一下」拆不开,仍按原句理解。
+  if (clauses.length < 2) {
+    const andParts = text
+      .split(/\s*(?:和|并且|以及)\s*/)
+      .map((s) => s.trim())
+      .filter((s) => s.length >= 2);
+    if (andParts.length === 2) clauses = andParts;
+  }
 
   if (clauses.length < 2) return undefined;
 
@@ -247,6 +257,21 @@ function mapIntentToPlanItem(intent: Intent): {
         amount,
         currency: "CNY",
         ...(intent.memo ? { memo: intent.memo } : {}),
+      },
+      moneyMovement: true,
+    };
+  }
+
+  if (intent.action === "subscription.cancel") {
+    const merchant = intent.subscription?.merchantName;
+    const subscriptionId = intent.subscription?.subscriptionId;
+    if (!merchant && !subscriptionId) return null;
+    return {
+      capability: "subscription.cancel",
+      label: `取消「${merchant ?? subscriptionId}」的代扣`,
+      input: {
+        ...(subscriptionId ? { __subscriptionId: subscriptionId, subscriptionId } : {}),
+        ...(merchant ? { __subQuery: merchant, merchantName: merchant } : {}),
       },
       moneyMovement: true,
     };
@@ -437,6 +462,13 @@ function parseIntent(text: string, now: number): Intent {
   const isSignConsent = /(签确认书|签署确认书|风险确认书|不匹配确认书|签一下确认书|我签|同意承担风险|确认承担风险)/.test(
     text,
   );
+  /**
+   * 到期续接。必须先于「到期」详情问句和「快到期」订阅提醒。
+   * 「什么时候到期」仍是产品详情;「会员快到期」仍是订阅。
+   */
+  const isRollover =
+    /(续接方案|怎么续接|到期续接|续接第|按续接方案申购|确认续接申购|为什么没放|没放进去|哪些没进|排除了哪些|第[0-9一二两三四五六七八九十]+\s*个?\s*续接|不续投|留在活期)/.test(text) ||
+    (/(理财|持仓)/.test(text) && /(快到期|即将到期|马上到期|就要到期|到期了|到期怎么办|到期怎么)/.test(text));
   // ★ 兜底:说了"买"类动词 + 泛指产品词但没具体动作 —— 「买理财」「买点理财」
   const isVagueWealth =
     /(买|申购|投|配置)/.test(text) && /(理财|基金|产品|标的)/.test(text) && !/(赎|卖|取)/.test(text);
@@ -713,6 +745,7 @@ function parseIntent(text: string, now: number): Intent {
   //   ⑧ 列表/推荐
   //   ⑨ 兜底:说了金额 + 理财语义词但没给动作词("我有5万块买理财")
   const isWealthIntent =
+    isRollover ||
     isSignConsent ||
     isRedeem ||
     isRedeemOrdinal ||
@@ -739,6 +772,7 @@ function parseIntent(text: string, now: number): Intent {
     (/大额/.test(text) && /(支出|消费|交易|扣|账单)/.test(text));
   const isRecurring =
     /(订阅|会员|自动扣|自动续费|定期扣|固定支出|每月.*扣|月供|续费|定期支出|固定扣款)/.test(text);
+  const isHealthLabel = /(财务健康|账单标签|餐饮偏高|支出接近收入)/.test(text);
   const isCashflow =
     /(收支|现金流|入账|赚了多少|存下|储蓄|结余|存了多少|每个月.*(存|剩))/i.test(text);
   const isInsight =
@@ -875,6 +909,8 @@ function parseIntent(text: string, now: number): Intent {
     } else if (isCardList) action = "card.list";
     else if (isCardDetail) action = "card.detail";
     else action = "card.list";
+  } else if (isRollover) {
+    action = "wealth.rollover_plan";
   } else if (isSubIntent) {
     // ★ 顺序说明(为什么排在卡片之后、理财之前):
     //   ① 卡片在前 —— 「把那张卡的自动续费关了」里的"卡"必须先被卡片场景接住;
@@ -906,7 +942,9 @@ function parseIntent(text: string, now: number): Intent {
     else if (isEventList) action = "event.list";
     else action = "cross_scene_event_planning";
   } else if (isWealthIntent) {
-    action = isSignConsent
+    action = isRollover
+      ? "wealth.rollover_plan"
+      : isSignConsent
       ? "wealth.sign_consent"
       : isRedeem || isRedeemOrdinal
         ? "wealth.redeem"
@@ -943,6 +981,7 @@ function parseIntent(text: string, now: number): Intent {
   else if (isReport) action = "account.report";
   else if (isAnomaly) action = "account.anomalies";
   else if (isRecurring) action = "account.recurring";
+  else if (isHealthLabel) action = "account.health_label";
   else if (isCashflow) action = "account.cashflow";
   else if (isInsight) action = "account.insights";
   else if (isBudget) action = "account.budget_plan";
@@ -1109,7 +1148,10 @@ function extractWealthRef(text: string): Intent["wealth"] {
   }
 
   // 2b) 产品类型倾向(与档位偏好互补:用户可能只说类型不说档位)
-  if (!hasNamedProduct) {
+  // 「有哪些货币基金」里的「货币」会被产品名后缀规则当成一只产品,类型就丢了。
+  // 货币基金 / 现金管理类是品类,不是某一只的名字。
+  if (/(货币基金|现金管理类)/.test(text)) w.typePreference = "cash";
+  else if (!hasNamedProduct) {
     if (/(货币|活期|现金管理)/.test(text)) w.typePreference = "cash";
     else if (/(债券|债基|纯债|固收)/.test(text)) w.typePreference = "fixed_income";
     else if (/(混合|平衡)/.test(text)) w.typePreference = "mixed";
@@ -1495,6 +1537,9 @@ function asksLimitAmount(text: string): boolean {
     q.fromIso = new Date(now - 3 * day).toISOString();
   } else if (/最近一周|近一周|最近7天/.test(text)) {
     q.fromIso = new Date(now - 7 * day).toISOString();
+  } else if (/近三个月|近3个月|这三个月/.test(text)) {
+    const d = new Date(now);
+    q.fromIso = new Date(d.getFullYear(), d.getMonth() - 2, 1).toISOString();
   }
 
   return Object.keys(q).length > 0 ? q : undefined;
@@ -2094,6 +2139,8 @@ function buildRestatement(input: {
       return "用户想查询理财持仓与收益";
     case "wealth.sign_consent":
       return "用户想签署风险不匹配确认书";
+    case "wealth.rollover_plan":
+      return "用户想看即将到期理财的续接方案(只比较,不申购)";
     // ---- 跨场景事件联动(新场景)----
     //
     // ★ 复述里必须带上"只出方案/只办一步"的意思:复述是审计的一部分,

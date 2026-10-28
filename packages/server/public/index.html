@@ -23,7 +23,7 @@
     <!-- Remix Icon:本地化托管,避免外部 CDN 被拦截/网络不通导致图标不显示 -->
     <link rel="stylesheet" href="/vendor/remixicon/remixicon.css?v=20261017" />
     <!-- 版本号每次改动都要改:否则浏览器会继续用缓存里的旧 app.js/app.css -->
-    <link rel="stylesheet" href="/app.css?v=20261019a" />
+    <link rel="stylesheet" href="/app.css?v=20261028e" />
   </head>
   <body>
     <!--
@@ -58,15 +58,16 @@
 
         <!-- App 顶栏 -->
         <header class="appbar">
-          <button class="appbar-btn" id="btn-menu" aria-label="打开常用服务与账户">
+          <button class="appbar-btn" id="btn-menu" aria-label="打开办事台">
             <i class="ri-menu-2-line" aria-hidden="true"></i>
+            <span class="menu-badge" id="menu-badge" hidden>0</span>
           </button>
           <button class="appbar-btn" id="btn-back" aria-label="返回" hidden>
             <i class="ri-arrow-left-s-line" aria-hidden="true"></i>
           </button>
           <div class="appbar-title">
             <span class="appbar-name">银行智能助手</span>
-            <span class="appbar-sub" id="appbar-sub">在线 · 支持转账 / 账单 / 理财 / 卡片</span>
+            <span class="appbar-sub" id="appbar-sub">在线 · 待办在左上角办事台</span>
           </div>
           <button class="appbar-btn" id="btn-history" aria-label="历史记录">
             <i class="ri-history-line" aria-hidden="true"></i>
@@ -98,6 +99,7 @@
 
         <!-- 输入区 -->
         <footer class="composer" id="composer">
+          <div class="thread-tags" id="thread-tags" hidden></div>
           <form class="inputbar" id="form" autocomplete="off">
             <input
               class="input"
@@ -117,11 +119,11 @@
         </footer>
 
         <!--
-          左侧模态抽屉:常用服务 / 我的常用流程 / 我的卡片 / 账户概览。
+          左侧办事台:待您处理 / 为您留意 / 常用流程 / 常用服务 / 卡片 / 账户。
           平时收起来,点顶栏左上角按钮或遮罩滑出/收回 —— 对话区只留对话本身。
         -->
         <div class="drawer-mask" id="drawer-mask" hidden>
-          <aside class="drawer" role="dialog" aria-label="常用服务与账户概览">
+          <aside class="drawer" role="dialog" aria-label="办事台">
             <div class="drawer-head">
               <div class="drawer-user">
                 <div class="drawer-av"><i class="ri-user-3-line" aria-hidden="true"></i></div>
@@ -142,8 +144,8 @@
       <aside class="sidenote">
         <h1>手机银行 App 入口</h1>
         <ul>
-          <li><b>右侧对话</b>:直接用自然语言提需求</li>
-          <li><b>左上抽屉</b>:常用服务 / 我的卡片 / 账户概览</li>
+          <li><b>右侧对话</b>:同一段里连续办多件事,刷新也还是这一段</li>
+          <li><b>左上办事台</b>:待您处理 / 为您留意 / 常用流程 / 常用服务</li>
           <li><b>强验证</b>:遇到人脸识别时会弹出模拟验证条</li>
           <li><b>时钟按钮</b>:历史会话列表与只读回放(能看不能办)</li>
           <li><b>盾牌按钮</b>:看审计链与本次会话的裁决明细</li>
@@ -152,6 +154,6 @@
       </aside>
     </div>
 
-    <script type="module" src="/app.js?v=20261019a"></script>
+    <script type="module" src="/app.js?v=20261028e"></script>
   </body>
 </html>

@@ -63,6 +63,8 @@ const FAMILIES: Record<string, FlowFamily> = {
   "wealth.purchase": { key: "wealth_purchase", label: "理财申购", saveable: true },
   "wealth.redeem": { key: "wealth_redeem", label: "理财赎回", saveable: true },
   "wealth.risk_assess": { key: "wealth_assess", label: "风险测评", saveable: false },
+  "wealth.rollover_plan": { key: "wealth_rollover_plan", label: "到期续接方案", saveable: false },
+  "wealth.rollover_choose": { key: "wealth_rollover_choose", label: "登记续接选择", saveable: false },
   "card.report_loss": { key: "card_loss", label: "挂失冻结", saveable: false },
   "card.replace": { key: "card_replace", label: "补卡申请", saveable: true },
   "card.unblock": { key: "card_unblock", label: "解除限制申请", saveable: false },

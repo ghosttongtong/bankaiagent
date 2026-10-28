@@ -55,8 +55,11 @@ import type {
   TransferDraft,
   TransferIntent,
   TransferReceipt,
+  DemandDepositRate,
+  MaturityDisposition,
   WealthHolding,
   WealthProduct,
+  WealthRolloverChoice,
   WealthProductQuery,
   WealthPurchaseInput,
   WealthPurchaseReceipt,
@@ -446,6 +449,11 @@ interface InternalHolding {
   shares: number;
   costAmount: number;
   firstPurchaseAt: number;
+  /** 银行侧到期日。开放式产品不填 */
+  maturityAt?: number;
+  maturityDisposition?: MaturityDisposition;
+  /** 到期资金已记入活期。演示种子不置位,避免到期前就能申购 */
+  maturityCredited?: boolean;
 }
 
 interface InternalRedemption {
@@ -558,6 +566,8 @@ export function buildDemoWorld(options?: { now?: number; months?: number; seed?:
    *   需要的不是等级本身,而是**他当时到底答了什么**。
    *   只存结果是不可复核的 —— 而不可复核的评级在合规上等于没有评级。
    */
+  /** 到期续接选择。按 `${customerId}:${holdingId}` 只留最新一条,不代表已申购 */
+  const wealthRolloverChoices = new Map<string, WealthRolloverChoice>();
   const riskAssessmentLog: Array<{
     customerId: string;
     score: number;
@@ -1014,9 +1024,25 @@ export function buildDemoWorld(options?: { now?: number; months?: number; seed?:
     shares: number;
     costAmount: number;
     daysAgoHeld: number;
+    /** 相对今天的到期日。只给封闭式、且银行已经写下到期日的持仓 */
+    maturityInDays?: number;
+    maturityDisposition?: MaturityDisposition;
   }> = [
     { productCode: "LC2002", shares: 15_010.51, costAmount: 20_000, daysAgoHeld: 165 },
     { productCode: "LC3002", shares: 3_396.65, costAmount: 6_000, daysAgoHeld: 210 },
+    /**
+     * 稳健增利 90 天,T-3 到期,到期后回活期。
+     * 市值故意小于另外两笔种子持仓,避免打乱「卖第2个 = 科技成长精选」的持仓序号。
+     * 到期日写在持仓上,不用申购日加期限去推。
+     */
+    {
+      productCode: "LC1002",
+      shares: 3_000,
+      costAmount: 3_200,
+      daysAgoHeld: 87,
+      maturityInDays: 3,
+      maturityDisposition: "to_demand",
+    },
   ];
 
   for (const seed of SEED_HOLDINGS) {
@@ -1031,6 +1057,8 @@ export function buildDemoWorld(options?: { now?: number; months?: number; seed?:
       shares: seed.shares,
       costAmount: seed.costAmount,
       firstPurchaseAt: purchasedAt,
+      ...(seed.maturityInDays != null ? { maturityAt: now + seed.maturityInDays * 24 * 3600 * 1000 } : {}),
+      ...(seed.maturityDisposition ? { maturityDisposition: seed.maturityDisposition } : {}),
     });
     wealthPurchases.push({
       orderId: detIdFromString("WPU", `${PRIMARY}:${seed.productCode}:${purchasedAt}`),
@@ -1570,6 +1598,7 @@ export function buildDemoWorld(options?: { now?: number; months?: number; seed?:
     // 理财(场景三)
     wealthProducts,
     wealthHoldings,
+    wealthRolloverChoices,
     wealthRiskProfiles,
     wealthPurchases,
     wealthRedemptions,
@@ -2630,9 +2659,57 @@ export class MockBankPort implements BankPort {
         firstPurchaseAt: h.firstPurchaseAt,
         settlement: product.settlement,
         holdingDays: Math.max(0, Math.floor((this.world.now - h.firstPurchaseAt) / (24 * 3600 * 1000))),
+        ...(h.maturityAt != null ? { maturityAt: h.maturityAt } : {}),
+        ...(h.maturityDisposition ? { maturityDisposition: h.maturityDisposition } : {}),
+        ...(h.maturityCredited ? { maturityCredited: true } : {}),
       });
     }
     return out.sort((a, b) => b.marketValue - a.marketValue);
+  }
+
+  async getDemandDepositRate(customerId: string): Promise<DemandDepositRate> {
+    const asOf = this.world.now;
+    return {
+      annualRatePct: 0.2,
+      effectiveFrom: asOf - 40 * 24 * 3600 * 1000,
+      accountTypeLabel: "人民币活期存款",
+      asOf,
+      source: "本行人民币存款利率表",
+    };
+  }
+
+  async saveRolloverChoice(input: {
+    customerId: string;
+    planId: string;
+    holdingId: string;
+    decision: WealthRolloverChoice["decision"];
+    productCode: string | null;
+    productName: string | null;
+    amountBasis: number;
+    status: WealthRolloverChoice["status"];
+    gate: string;
+    note: string;
+  }): Promise<WealthRolloverChoice> {
+    const choice: WealthRolloverChoice = {
+      choiceId: detIdFromString("RCH", `${input.customerId}:${input.holdingId}:${input.planId}:${input.decision}:${this.world.now}`),
+      customerId: input.customerId,
+      planId: input.planId,
+      holdingId: input.holdingId,
+      decision: input.decision,
+      productCode: input.productCode,
+      productName: input.productName,
+      amountBasis: input.amountBasis,
+      status: input.status,
+      gate: input.gate,
+      createdAt: this.world.now,
+      note: input.note,
+    };
+    this.world.wealthRolloverChoices.set(`${input.customerId}:${input.holdingId}`, choice);
+    return choice;
+  }
+
+  async getRolloverChoice(customerId: string, holdingId: string): Promise<WealthRolloverChoice | null> {
+    return this.world.wealthRolloverChoices.get(`${customerId}:${holdingId}`) ?? null;
   }
 
   async getRiskProfile(customerId: string): Promise<WealthRiskProfile> {    return this.world.wealthRiskProfiles.get(customerId) ?? emptyRiskProfile(customerId);
@@ -2729,6 +2806,12 @@ export class MockBankPort implements BankPort {
         shares: math.shares,
         costAmount: input.amount,
         firstPurchaseAt: this.world.now,
+        ...(product.termDays != null
+          ? {
+              maturityAt: this.world.now + product.termDays * 24 * 3600 * 1000,
+              maturityDisposition: "to_demand" as const,
+            }
+          : {}),
       });
     }
 
@@ -3858,8 +3941,37 @@ export function maskAccountNo(accountNo: string): string {
 // 理财工具
 // ============================================================================
 
+/**
+ * 近 6 个月最大回撤(百分比点数)。
+ * 存款类没有净值回撤,记 null,展示时写「未披露」,不用文案里的「超 25%」去填。
+ */
+const DRAWDOWN_6M_PCT: Record<string, number | null> = {
+  LC1001: 0.04,
+  LC1002: 0.38,
+  LC1003: 0.91,
+  LC2001: 3.46,
+  LC2002: 6.2,
+  LC3001: 14.8,
+  LC3002: 27.4,
+  LC4001: null,
+  LC5001: 19.1,
+};
+const DRAWDOWN_METHOD = "区间内复权净值从峰值到谷值的最大跌幅";
+
 /** 目录种子 → 对外产品快照(净值日期统一取当前时间,演示可复现) */
 function toPublicProduct(p: WealthProductSeed): WealthProduct {
+  const navDate = p.navDate ?? Date.now();
+  const pct = DRAWDOWN_6M_PCT[p.productCode];
+  const maxDrawdown6m =
+    pct == null
+      ? null
+      : {
+          pct,
+          windowStart: navDate - 180 * 24 * 3600 * 1000,
+          windowEnd: navDate,
+          method: DRAWDOWN_METHOD,
+          asOf: navDate,
+        };
   return {
     productCode: p.productCode,
     name: p.name,
@@ -3872,7 +3984,7 @@ function toPublicProduct(p: WealthProductSeed): WealthProduct {
     yield1y: p.yield1y,
     performanceBenchmark: p.performanceBenchmark,
     nav: p.nav,
-    navDate: p.navDate ?? Date.now(),
+    navDate,
     managementFeeRate: p.managementFeeRate,
     custodyFeeRate: p.custodyFeeRate,
     purchaseFeeRate: p.purchaseFeeRate,
@@ -3882,6 +3994,7 @@ function toPublicProduct(p: WealthProductSeed): WealthProduct {
     status: p.status,
     riskDisclosure: p.riskDisclosure,
     highlight: p.highlight,
+    maxDrawdown6m,
   };
 }
 

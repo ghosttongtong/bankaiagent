@@ -21,6 +21,8 @@ const sessionId = (() => {
   sessionStorage.setItem(SESSION_KEY, fresh);
   return fresh;
 })();
+/** 当前这段对话的标题。刷新后从会话记录恢复,用来标明「还是同一段」 */
+let sessionTitle = "";
 
 // ---- DOM ----
 const $ = (id) => document.getElementById(id);
@@ -100,6 +102,7 @@ setInterval(tickClock, 20000);
 
 function openDrawer() {
   drawerMask.hidden = false;
+  void refreshDesk();
 }
 
 function closeDrawer() {
@@ -117,6 +120,7 @@ document.addEventListener("keydown", (e) => {
 });
 // 抽屉里点任何可操作的入口(按钮 / 小卡片),先把抽屉收起来
 drawerBody.addEventListener("click", (e) => {
+  if (e.target.closest("[data-keep-open]")) return;
   if (e.target.closest("button, .mini-card")) closeDrawer();
 });
 
@@ -654,6 +658,8 @@ async function runAction(action, box) {
   try {
     const turn = await sendAction(action);
     renderTurn(turn);
+    void refreshDesk();
+    void refreshThreadTags();
   } catch (err) {
     addMessage({ role: "agent", text: `操作没有完成:${err.message}`, variant: "notice" });
   } finally {
@@ -1061,11 +1067,231 @@ function visualActions(actions) {
   return bar;
 }
 
+function yuanLabel(n) {
+  const value = Number(n);
+  if (!Number.isFinite(value)) return "—";
+  return `¥${value.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function chartRows(panel) {
+  const rows = document.createElement("div");
+  rows.className = "chart-rows";
+  const peak = Math.max(
+    1,
+    ...panel.series.flatMap((point) => [Number(point.value) || 0, Number(point.value2) || 0]),
+  );
+  for (const point of panel.series) {
+    const row = document.createElement("div");
+    row.className = "chart-row";
+    const name = document.createElement("div");
+    name.className = "chart-name";
+    name.textContent = point.label;
+    row.appendChild(name);
+    const tracks = document.createElement("div");
+    tracks.className = "chart-tracks";
+    const addBar = (amount, cls) => {
+      const track = document.createElement("div");
+      track.className = "chart-track";
+      const bar = document.createElement("span");
+      bar.className = `chart-bar ${cls}`;
+      bar.style.width = `${Math.max(2, (Math.max(0, Number(amount) || 0) / peak) * 100)}%`;
+      const num = document.createElement("span");
+      num.className = "chart-num";
+      num.textContent = yuanLabel(amount);
+      track.append(bar, num);
+      tracks.appendChild(track);
+    };
+    addBar(point.value, "inflow");
+    if (panel.chart === "grouped") addBar(point.value2 ?? 0, "out");
+    row.appendChild(tracks);
+    rows.appendChild(row);
+  }
+  return rows;
+}
+
+function wrapCanvasText(g, text, x, y, maxWidth, lineHeight) {
+  let line = "";
+  for (const ch of text) {
+    const trial = line + ch;
+    if (g.measureText(trial).width > maxWidth && line) {
+      g.fillText(line, x, y);
+      y += lineHeight;
+      line = ch;
+    } else {
+      line = trial;
+    }
+  }
+  if (line) {
+    g.fillText(line, x, y);
+    y += lineHeight;
+  }
+  return y;
+}
+
+/** 把柱和数据说明画进同一张 PNG。数字只用服务端给的 value,不再计算。 */
+function downloadBillChart(v) {
+  const width = 960;
+  const pad = 40;
+  const font = "'Microsoft YaHei', 'PingFang SC', sans-serif";
+  const measure = document.createElement("canvas").getContext("2d");
+  measure.font = `13px ${font}`;
+  let height = 92;
+  for (const panel of v.panels) {
+    height += 28;
+    for (const point of panel.series) {
+      height += panel.chart === "grouped" ? 46 : 28;
+    }
+    height += 12;
+  }
+  height += 36;
+  for (const note of v.notes) {
+    const wide = measure.measureText(note).width;
+    height += Math.ceil(wide / (width - pad * 2)) * 22 + 6;
+  }
+  height += 36;
+
+  const canvas = document.createElement("canvas");
+  const ratio = 2;
+  canvas.width = width * ratio;
+  canvas.height = height * ratio;
+  const g = canvas.getContext("2d");
+  g.scale(ratio, ratio);
+  g.fillStyle = "#ffffff";
+  g.fillRect(0, 0, width, height);
+  g.fillStyle = "#142033";
+  g.font = `700 22px ${font}`;
+  g.fillText(v.title, pad, 42);
+  g.font = `13px ${font}`;
+  g.fillStyle = "#5c6b80";
+  wrapCanvasText(g, v.subtitle, pad, 68, width - pad * 2, 20);
+
+  let y = 96;
+  for (const panel of v.panels) {
+    g.fillStyle = "#142033";
+    g.font = `600 15px ${font}`;
+    g.fillText(panel.title, pad, y);
+    if (panel.chart === "grouped") {
+      g.font = `12px ${font}`;
+      g.fillStyle = "#1d4ed8";
+      g.fillText(panel.legend[0] ?? "收入", width - 180, y);
+      g.fillStyle = "#cf3a2b";
+      g.fillText(panel.legend[1] ?? "支出", width - 110, y);
+    }
+    y += 18;
+    const peak = Math.max(1, ...panel.series.flatMap((point) => [Number(point.value) || 0, Number(point.value2) || 0]));
+    const labelWidth = 168;
+    const barMax = width - pad * 2 - labelWidth - 110;
+    for (const point of panel.series) {
+      const draw = (amount, color, offset) => {
+        g.fillStyle = "#142033";
+        g.font = `13px ${font}`;
+        if (offset === 0) g.fillText(point.label, pad, y + 12);
+        const w = (Math.max(0, Number(amount) || 0) / peak) * barMax;
+        g.fillStyle = color;
+        g.fillRect(pad + labelWidth, y + offset, Math.max(w, 2), 10);
+        g.fillStyle = "#5c6b80";
+        g.fillText(yuanLabel(amount), pad + labelWidth + w + 8, y + offset + 10);
+      };
+      draw(point.value, "#1d4ed8", 0);
+      if (panel.chart === "grouped") {
+        draw(point.value2 ?? 0, "#cf3a2b", 16);
+        y += 46;
+      } else {
+        y += 28;
+      }
+    }
+    y += 8;
+  }
+
+  g.fillStyle = "#142033";
+  g.font = `600 15px ${font}`;
+  g.fillText("数据说明", pad, y + 8);
+  y += 30;
+  g.font = `13px ${font}`;
+  g.fillStyle = "#334155";
+  for (const note of v.notes) {
+    y = wrapCanvasText(g, note, pad, y, width - pad * 2, 22);
+    y += 4;
+  }
+  g.fillStyle = "#8b98ab";
+  g.font = `12px ${font}`;
+  g.fillText("说明与柱使用同一份账单结果,模型未改写金额。", pad, Math.min(y + 8, height - 18));
+
+  const link = document.createElement("a");
+  link.href = canvas.toDataURL("image/png");
+  link.download = v.filename || "账单图表.png";
+  link.click();
+}
+
+function renderBillChart(v) {
+  const box = document.createElement("div");
+  box.className = "visual bill-chart";
+
+  const head = document.createElement("div");
+  head.className = "v-head";
+  const title = document.createElement("div");
+  title.className = "v-title";
+  title.textContent = v.title;
+  head.appendChild(title);
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "v-action";
+  save.textContent = "下载图表与说明";
+  save.addEventListener("click", () => downloadBillChart(v));
+  head.appendChild(save);
+  box.appendChild(head);
+
+  const sub = document.createElement("div");
+  sub.className = "chart-sub";
+  sub.textContent = v.subtitle;
+  box.appendChild(sub);
+
+  for (const panel of v.panels ?? []) {
+    const block = document.createElement("div");
+    block.className = "chart-panel";
+    const name = document.createElement("div");
+    name.className = "chart-panel-title";
+    name.textContent = panel.title;
+    block.appendChild(name);
+    if (panel.chart === "grouped") {
+      const legend = document.createElement("div");
+      legend.className = "chart-legend";
+      const a = document.createElement("span");
+      a.className = "lg inflow";
+      a.textContent = panel.legend?.[0] ?? "收入";
+      const b = document.createElement("span");
+      b.className = "lg out";
+      b.textContent = panel.legend?.[1] ?? "支出";
+      legend.append(a, b);
+      block.appendChild(legend);
+    }
+    block.appendChild(chartRows(panel));
+    box.appendChild(block);
+  }
+
+  if ((v.notes ?? []).length > 0) {
+    const notes = document.createElement("div");
+    notes.className = "chart-notes";
+    const label = document.createElement("div");
+    label.className = "chart-panel-title";
+    label.textContent = "数据说明";
+    notes.appendChild(label);
+    for (const note of v.notes) {
+      const line = document.createElement("p");
+      line.textContent = note;
+      notes.appendChild(line);
+    }
+    box.appendChild(notes);
+  }
+  return box;
+}
+
 function renderVisual(visual) {
   if (!visual) return null;
   if (visual.kind === "doc_diff") return renderDocDiff(visual);
   if (visual.kind === "review_plan") return renderReviewPlan(visual);
   if (visual.kind === "retraction") return renderRetraction(visual);
+  if (visual.kind === "bill_chart") return renderBillChart(visual);
   return null;
 }
 
@@ -1184,8 +1410,8 @@ function renderTurn(turn) {
 /** 拉取当前待确认动作并渲染成可操作卡片 */
 async function appendPendingCard() {
   try {
-    const p = (await get("/api/demo/pending")).pending;
-    if (!p) return;
+    const p = (await get(`/api/demo/pending?sessionId=${encodeURIComponent(sessionId)}`)).pending;
+    if (!p || (p.sessionId && p.sessionId !== sessionId)) return;
     const card = renderPendingCard(p);
     const wrap = document.createElement("div");
     wrap.className = "msg agent";
@@ -1240,6 +1466,8 @@ async function submit(text) {
   try {
     const turn = await sendText(value);
     renderTurn(turn);
+    void refreshDesk();
+    void refreshThreadTags();
   } catch (err) {
     addMessage({ role: "agent", text: `没能完成:${err.message}`, variant: "notice" });
   } finally {
@@ -1268,22 +1496,26 @@ inputEl.addEventListener("focus", () => {
 // ============================================================================
 
 const QUICK = [
-  { icon: "ri-bank-card-line", label: "我的卡片", text: "我有哪些卡?" },
-  { icon: "ri-line-chart-line", label: "额度管理", text: "信用卡额度太低能不能提额" },
-  { icon: "ri-alarm-warning-line", label: "挂失冻结", text: "卡丢了先挂失" },
-  { icon: "ri-lock-unlock-line", label: "解除限制", text: "卡被限制了帮我解开" },
-  { icon: "ri-add-circle-line", label: "办新卡", text: "想办一张新卡" },
   { icon: "ri-exchange-funds-line", label: "转账汇款", text: "给老妈转500,备注买菜" },
   { icon: "ri-bar-chart-2-line", label: "账单分析", text: "上个月账单报告" },
-  { icon: "ri-coins-line", label: "理财推荐", text: "我有5万块,推荐几个理财产品" },
+  { icon: "ri-coins-line", label: "理财", text: "我的理财持仓收益" },
+  { icon: "ri-bank-card-line", label: "我的卡片", text: "我有哪些卡?" },
+  { icon: "ri-alarm-warning-line", label: "挂失冻结", text: "卡丢了先挂失" },
 ];
+const QUICK_MORE = [
+  { icon: "ri-line-chart-line", label: "额度管理", text: "信用卡额度太低能不能提额" },
+  { icon: "ri-lock-unlock-line", label: "解除限制", text: "卡被限制了帮我解开" },
+  { icon: "ri-add-circle-line", label: "办新卡", text: "想办一张新卡" },
+  { icon: "ri-repeat-line", label: "订阅代扣", text: "订阅续费提醒" },
+];
+let quickMoreOpen = false;
 
 /** 对话区的开场:一条问候,入口指向左上抽屉,不再堆一整屏宫格 */
 function renderWelcome() {
   const name = profile?.displayName ?? "张先生";
   addMessage({
     role: "agent",
-    text: `${name},您好!有任何业务可以直接说,也可以点左上角按钮打开「常用服务 / 我的卡片 / 账户概览」。`,
+    text: `${name},您好!直接说即可。左上角是办事台:待确认、即将扣款和理财提醒都在那里,点开才会进对话,不会自动办理。`,
   });
 }
 
@@ -1361,29 +1593,87 @@ function uiRow(label, value) {
   return row;
 }
 
-/** 抽屉内容:常用服务 / 我的常用流程 / 我的卡片 / 主动建议 / 账户概览 */
+function quickButton(q) {
+  const b = document.createElement("button");
+  b.type = "button";
+  const icon = document.createElement("i");
+  icon.className = `qi ${q.icon}`;
+  icon.setAttribute("aria-hidden", "true");
+  const lab = document.createElement("span");
+  lab.textContent = q.label;
+  b.append(icon, lab);
+  b.addEventListener("click", () => submit(q.text));
+  return b;
+}
+
+function deskList(items) {
+  const list = document.createElement("div");
+  list.className = "desk-list";
+  for (const item of items) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `desk-item desk-${item.kind}`;
+    const title = document.createElement("div");
+    title.className = "desk-title";
+    title.textContent = item.title;
+    const detail = document.createElement("div");
+    detail.className = "desk-detail";
+    detail.textContent = item.detail;
+    b.append(title, detail);
+    b.addEventListener("click", () => {
+      if (item.say) submit(item.say);
+    });
+    list.appendChild(b);
+  }
+  return list;
+}
+
+function updateDeskChrome() {
+  const actions = profile?.personalization?.desk?.actions ?? [];
+  const badge = $("menu-badge");
+  if (badge) {
+    badge.hidden = actions.length === 0;
+    badge.textContent = actions.length > 9 ? "9+" : String(actions.length);
+  }
+  if (paneChat && !paneChat.hidden && paneAudit?.hidden && paneHistory?.hidden) {
+    const thread = sessionTitle ? `本对话 · ${sessionTitle}` : "本对话连续办理";
+    appbarSub.textContent = actions.length > 0 ? `${actions.length} 项待处理 · ${thread}` : thread;
+  }
+}
+
+/** 办事台数据来自 /api/personalization,前端不自己拼到期日或待确认 */
+async function refreshDesk() {
+  try {
+    const view = await get(`/api/personalization?sessionId=${encodeURIComponent(sessionId)}`);
+    if (!profile) profile = {};
+    profile.personalization = {
+      flows: view.flows ?? [],
+      suggestions: view.suggestions ?? [],
+      history: view.history ?? profile.personalization?.history ?? [],
+      desk: view.desk ?? { actions: [], notices: [] },
+    };
+    renderDrawer();
+  } catch {
+    updateDeskChrome();
+  }
+}
+
+/** 抽屉:待您处理 / 为您留意 / 常用流程 / 常用服务 / 卡片 / 账户 */
 function renderDrawer() {
   drawerBody.innerHTML = "";
   const hero = document.createElement("div");
   hero.className = "hero";
 
-  // 常用服务
-  hero.appendChild(sectionTitle("常用服务"));
-  const quick = document.createElement("div");
-  quick.className = "quick";
-  for (const q of QUICK) {
-    const b = document.createElement("button");
-    b.type = "button";
-    const icon = document.createElement("i");
-    icon.className = `qi ${q.icon}`;
-    icon.setAttribute("aria-hidden", "true");
-    const lab = document.createElement("span");
-    lab.textContent = q.label;
-    b.append(icon, lab);
-    b.addEventListener("click", () => submit(q.text));
-    quick.appendChild(b);
+  const actions = profile?.personalization?.desk?.actions ?? [];
+  const notices = profile?.personalization?.desk?.notices ?? [];
+  if (actions.length > 0) {
+    hero.appendChild(sectionTitle("待您处理"));
+    hero.appendChild(deskList(actions));
   }
-  hero.appendChild(quick);
+  if (notices.length > 0) {
+    hero.appendChild(sectionTitle("为您留意"));
+    hero.appendChild(deskList(notices));
+  }
 
   /**
    * ★ 客户自己的常用流程:只展示**真的用过**的一两条。
@@ -1413,6 +1703,25 @@ function renderDrawer() {
     hero.appendChild(strip);
   }
 
+  hero.appendChild(sectionTitle("常用服务"));
+  const quick = document.createElement("div");
+  quick.className = "quick";
+  for (const q of QUICK) quick.appendChild(quickButton(q));
+  if (quickMoreOpen) {
+    for (const q of QUICK_MORE) quick.appendChild(quickButton(q));
+  }
+  const more = document.createElement("button");
+  more.type = "button";
+  more.dataset.keepOpen = "1";
+  more.className = "quick-more";
+  more.textContent = quickMoreOpen ? "收起" : "更多";
+  more.addEventListener("click", () => {
+    quickMoreOpen = !quickMoreOpen;
+    renderDrawer();
+  });
+  quick.appendChild(more);
+  hero.appendChild(quick);
+
   // 卡片概览
   const cards = profile?.cards ?? [];
   if (cards.length > 0) {
@@ -1424,19 +1733,6 @@ function renderDrawer() {
       strip.appendChild(miniCard(c));
     }
     hero.appendChild(strip);
-  }
-
-  /**
-   * ★ 抽屉里的主动建议。
-   *
-   *   与对话里的建议同源(同一条规则、同一份依据)。抽屉是"客户还没开口"时
-   *   最常翻开的面板,这里出现一条有依据的建议,才是"个性化"最有价值的位置。
-   *   数据来自 /api/personalization(启动时拉取一次)。
-   */
-  const drawerSuggests = renderSuggestions(profile?.personalization?.suggestions ?? []);
-  if (drawerSuggests) {
-    hero.appendChild(sectionTitle("我想到可以帮您做的事"));
-    hero.appendChild(drawerSuggests);
   }
 
   // 账户概览
@@ -1459,12 +1755,12 @@ function renderDrawer() {
     nb.appendChild(r);
   }
   nb.appendChild(uiRow("风险等级", profile?.wealth?.assessed ? `${profile.wealth.level}(${profile.wealth.levelLabel})` : "未测评"));
-  // nb.appendChild(uiRow("服务渠道", "手机银行 App(低风险 · 支持人脸)"));
 
   note.appendChild(nb);
   hero.appendChild(note);
 
   drawerBody.appendChild(hero);
+  updateDeskChrome();
 }
 
 function miniCard(c) {
@@ -1524,6 +1820,9 @@ const REPLAY_PREFILL_KEY = "bank-agent-replay-prefill";
  *   两种视图都**不能办事** —— 这句话是界面上的第一层,后端"不返回 pendingId"
  *   与跨会话确认拒绝(G2/G3)是第二、第三层。
  */
+/** 历史列表当前筛的业务标签。空字符串 = 全部。标签来自服务端的 family,前端不自己归类。 */
+let historyFamilyFilter = "";
+
 const HISTORY_BANNER =
   "历史记录仅供查看,不能在这里确认或撤销任何操作。要再办一次,在详情里点『再办一次』—— 会重新走确认与验证。";
 
@@ -1548,7 +1847,7 @@ function closeHistory() {
   paneChat.hidden = false;
   composer.hidden = false;
   btnBack.hidden = true;
-  appbarSub.textContent = "在线 · 支持转账 / 账单 / 理财 / 卡片";
+  updateDeskChrome();
   scrollToEnd();
 }
 
@@ -1585,11 +1884,45 @@ async function refreshHistory() {
   }
 
   historyBody.appendChild(historyBanner());
+  const filters = historyFilters(operations);
+  if (filters) historyBody.appendChild(filters);
+
+  const shown = historyFamilyFilter ? operations.filter((op) => op.family === historyFamilyFilter) : operations;
+  if (shown.length === 0) {
+    historyBody.appendChild(historyNotice("这一类业务在记录里还没有。"));
+    return;
+  }
 
   const list = document.createElement("div");
   list.className = "hr-list";
-  for (const op of operations) list.appendChild(historyItem(op));
+  for (const op of shown) list.appendChild(historyItem(op));
   historyBody.appendChild(list);
+}
+
+function historyFilters(operations) {
+  const families = [];
+  for (const op of operations) {
+    if (op.family && !families.includes(op.family)) families.push(op.family);
+  }
+  if (families.length < 2) return null;
+  if (historyFamilyFilter && !families.includes(historyFamilyFilter)) historyFamilyFilter = "";
+
+  const bar = document.createElement("div");
+  bar.className = "hr-filters";
+  const add = (label, value) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = historyFamilyFilter === value ? "hr-filter on" : "hr-filter";
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      historyFamilyFilter = value;
+      void refreshHistory();
+    });
+    bar.appendChild(button);
+  };
+  add("全部", "");
+  for (const family of families) add(family, family);
+  return bar;
 }
 
 function historyBanner() {
@@ -1903,7 +2236,7 @@ function closeAudit() {
   paneChat.hidden = false;
   composer.hidden = false;
   btnBack.hidden = true;
-  appbarSub.textContent = "在线 · 支持转账 / 账单 / 理财 / 卡片";
+  updateDeskChrome();
   scrollToEnd();
 }
 
@@ -1983,16 +2316,78 @@ btnBack.addEventListener("click", () => {
 // 启动
 // ============================================================================
 
+/**
+ * 把当前 sessionId 上已经落盘的原话画回对话区。
+ *
+ * 刷新、重开页面都还是这一段,不能画成空白新对话 ——
+ * 服务端的待确认还挂在这段上,空白界面会让人不知道「确认」确认的是哪一笔。
+ * 这里只回放文本。确认按钮只在这笔待办仍属于本会话时补上。
+ */
+async function restoreCurrentSession() {
+  let session = null;
+  try {
+    session = (await get(`/api/sessions/${encodeURIComponent(sessionId)}`)).session;
+  } catch {
+    session = null;
+  }
+  const turns = session?.turns ?? [];
+  if (turns.length === 0) {
+    renderThreadTags([]);
+    renderWelcome();
+    return;
+  }
+  sessionTitle = session.title && session.title !== "新会话" ? session.title : "";
+  renderThreadTags(session.tags ?? []);
+  for (const turn of turns) {
+    addMessage({ role: turn.role === "user" ? "user" : "agent", text: turn.text });
+  }
+  updateDeskChrome();
+  await appendPendingCard();
+}
+
+/** 本段对话的业务标签。同一段可以有多笔,标签只标明办过什么,不新开会话。 */
+function renderThreadTags(tags) {
+  const bar = $("thread-tags");
+  if (!bar) return;
+  bar.replaceChildren();
+  if (!tags || tags.length === 0) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  const label = document.createElement("span");
+  label.className = "thread-tags-label";
+  label.textContent = "本段";
+  bar.appendChild(label);
+  for (const tag of tags) {
+    const chip = document.createElement("span");
+    chip.className = "thread-tag";
+    chip.textContent = tag;
+    bar.appendChild(chip);
+  }
+}
+
+async function refreshThreadTags() {
+  try {
+    const session = (await get(`/api/sessions/${encodeURIComponent(sessionId)}`)).session;
+    if (session?.title && session.title !== "新会话") sessionTitle = session.title;
+    renderThreadTags(session?.tags ?? []);
+    updateDeskChrome();
+  } catch {
+    // 标签是辨认用的,取不到不影响继续办
+  }
+}
+
 async function boot() {
   try {
-    profile = await get("/api/demo/profile");
+    profile = await get(`/api/demo/profile?sessionId=${encodeURIComponent(sessionId)}`);
   } catch {
     profile = null;
   }
 
-  renderWelcome();
   renderDrawer();
   fillDrawerHead();
+  await restoreCurrentSession();
   inputEl.focus();
 
   // 「再办一次」后的预填:上一轮用户原话(读完即删,避免下次刷新又冒出来)

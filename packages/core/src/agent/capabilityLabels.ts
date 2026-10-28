@@ -43,6 +43,7 @@ const CAPABILITY_LABELS: Record<string, string> = {
   "account.detect_recurring": "定期支出识别",
   "account.cashflow": "收支分析",
   "account.insights": "账单洞察",
+  "account.health_label": "财务健康标签",
   "account.budget_plan": "预算规划",
   "account.analyze_spending": "消费分析",
   "account.list_balances": "余额查询",
@@ -79,6 +80,8 @@ const CAPABILITY_LABELS: Record<string, string> = {
   "wealth.purchase": "理财购买",
   "wealth.redeem": "理财赎回",
   "wealth.holdings": "持仓查询",
+  "wealth.rollover_plan": "到期续接方案",
+  "wealth.rollover_choose": "登记续接选择",
   // ---- 制度问答与历史记录 ----
   "policy.search": "制度条款查询",
   "memory.search": "历史记录查询",

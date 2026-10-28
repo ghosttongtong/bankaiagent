@@ -69,6 +69,7 @@ export function buildIntentSystemPrompt(input: {
 - "我有哪些订阅" / "每月固定支出多少" / "哪些是自动续费" → account.recurring
 - "我这半年收支怎么样" / "每月存得下钱吗" / "现金流分析" → account.cashflow
 - "给我点省钱建议" / "分析下我的消费习惯" / "账单有什么问题" → account.insights
+- "看看财务健康标签" / "我的账单标签" → account.health_label。这是近几个月流水打的标签,不要填预期收益,不要写成已经申购或已经定投
 - "帮我规划这个月预算" / "这个月还剩多少能花" / "预算5000够不够" / "每天能花多少" → account.budget_plan
 - "帮我比对这几份材料" / "合同和发票金额对不上" / "这几份单据有没有矛盾" → document.compare
 - "再扫一遍异常" / "还有没有漏的异常" / "重新检查一下可疑交易" → account.review_anomalies
@@ -96,6 +97,8 @@ export function buildIntentSystemPrompt(input: {
 - "把我上次买的那个理财赎回" / "赎回一万" / "卖掉那个基金" / "取出来" → wealth.redeem
 - "我的理财赚了多少" / "我持有哪些产品" / "持仓怎么样" → wealth.holdings
 - "我签确认书" / "同意承担风险" → wealth.sign_consent
+- "理财快到期了怎么办" / "看看这笔到期怎么续接" / "续接第1个" / "不续投" → wealth.rollover_plan
+  ★ 这是到期续接方案,不是申购。不要解析成 wealth.purchase,也不要填预计收益。
 
 ★ 理财场景的区分要点(极易误判,务必注意):
 - **"我有5万块,推荐几个理财产品"是理财咨询,不是转账**。这句话里有金额,
@@ -344,6 +347,7 @@ export function buildIntentSystemPrompt(input: {
    payee.manage / collection.create / collection.pay_share / collection.remind / collection.query /
    account.balance / account.transactions / account.analysis /
    account.report / account.anomalies / account.recurring / account.cashflow / account.insights /
+   account.health_label /
    account.budget_plan /
    document.compare / account.review_anomalies / account.anomaly_withdraw /
    wealth.list_products / wealth.product_detail / wealth.compare / wealth.risk_assess /
@@ -494,9 +498,10 @@ export async function parseIntent(options: ParseIntentOptions): Promise<ParseInt
     if (result.ok) {
       // 归一化:填入 Schema 默认值,后续代码只面对完整形态
       const normalized = ParsedRequestSchema.parse(result.value);
+      const parsed = fillMissingPlanFromRules(options.userText, options.context.nowIso, normalized);
       return {
         ok: true,
-        parsed: normalized,
+        parsed,
         usage: result.raw?.usage,
         latencyMs: Date.now() - started,
         provider: options.provider.name,
@@ -522,6 +527,18 @@ export async function parseIntent(options: ParseIntentOptions): Promise<ParseInt
  * 设计取舍:这里**不做静默降级** —— 降级原因会一并返回,由编排器写入审计。
  * 一个隐瞒自己降级了的系统,在事故复盘时是不可信的。
  */
+/**
+ * 模型只听进一件事时,用规则拆出来的计划补上。
+ * 同一句话里的第二件不能等用户再提醒。
+ */
+function fillMissingPlanFromRules(userText: string, nowIso: string, parsed: ParsedRequest): ParsedRequest {
+  if ((parsed.multiIntent?.items.length ?? 0) >= 2) return parsed;
+  const now = Date.parse(nowIso);
+  const rules = parseWithRules(userText, Number.isFinite(now) ? now : Date.now());
+  if (!rules.multiIntent || rules.multiIntent.items.length < 2) return parsed;
+  return { ...parsed, multiIntent: rules.multiIntent };
+}
+
 function deterministicFallback(
   options: ParseIntentOptions,
   started: number,

@@ -106,6 +106,18 @@ type IdentityFailure = { identity: null; reason: "no_session" | "invalid_session
  * ★ 判据是"family 为空或等于能力名",不是"白名单已知族名":
  *   前者只会纠正坏值,不会覆盖上游将来新增的、更好的族名。
  */
+/** 一段对话里的业务标签:按出现顺序去重,最多 8 个。标签不是新会话。 */
+function businessTags(rows: Array<{ family?: string }>): string[] {
+  const tags: string[] = [];
+  for (const row of rows) {
+    const family = row.family?.trim();
+    if (!family || tags.includes(family)) continue;
+    tags.push(family);
+    if (tags.length >= 8) break;
+  }
+  return tags;
+}
+
 function businessFamily(row: HistoryRecord): string {
   if (row.family && row.family !== row.capability) return row.family;
   return flowFamilyOf(row.capability).label;
@@ -835,9 +847,12 @@ async function handleRequest(
      *   取不到就如实返回 null(已经办完或已过期),让界面提示"这笔处理过了",
      *   而不是悄悄改签最新那一笔。
      */
+    const sessionId = url.searchParams.get("sessionId");
     const candidate = refId
       ? app.orchestrator.pending.get(refId)
-      : app.orchestrator.pending.latestFor(customerId, app.now());
+      : sessionId
+        ? app.orchestrator.pending.latestForSessionStrict(customerId, sessionId, app.now())
+        : app.orchestrator.pending.latestFor(customerId, app.now());
     const pending =
       candidate && candidate.customerId === customerId && candidate.expiresAt > app.now()
         ? candidate
@@ -861,6 +876,7 @@ async function handleRequest(
               payloadHash: pending.payloadHash,
               input: pending.input,
             }),
+            sessionId: pending.sessionId,
             createdAt: pending.createdAt,
             expiresAt: pending.expiresAt,
             fraudLevel: pending.fraudLevel,
@@ -929,6 +945,7 @@ async function handleRequest(
     }
     const ledger = await app.personalization.ledger(customerId);
     const ops = ledger.filter((row) => row.sessionId === sessionId);
+    const businesses = collapseBusinesses(ops).map(toOperationView);
 
     sendJson(res, 200, {
       ok: true,
@@ -955,6 +972,8 @@ async function handleRequest(
           traceId: t.traceId,
         })),
         operations: ops.map(toOperationView),
+        /** 本段对话里出现过的业务标签。只用于辨认和筛选,不代表会话被切开。 */
+        tags: businessTags(businesses),
         /**
          * ★ 同一批台账的两种读法,口径不同、用途不同:
          *   · operations:事件流水(一步一行)—— 一笔转账会有「待你确认」+「已转账成功」两行;
@@ -962,7 +981,7 @@ async function handleRequest(
          *   客户点进来找的是"我那一笔",所以详情页的业务清单一律读 businesses;
          *   operations 保留原样,谁要追溯确认过程都还能查到,不丢信息。
          */
-        businesses: collapseBusinesses(ops).map(toOperationView),
+        businesses,
       },
     });
     return;
@@ -1037,10 +1056,12 @@ async function handleRequest(
   // ---- 个性化:常用流程 + 历史业务 + 智能建议(首页"常用服务"的数据来源) ----
   if (method === "GET" && path === "/api/personalization") {
     const customerId = identity.customerId;
-    const view = await app.personalizationView(customerId);
+    const sessionId = url.searchParams.get("sessionId") ?? undefined;
+    const view = await app.personalizationView(customerId, sessionId);
     sendJson(res, 200, {
       ok: true,
       customerId,
+      desk: view.desk,
       flows: view.flows.map((f) => ({
         templateId: f.templateId,
         name: f.name,
@@ -1203,7 +1224,7 @@ async function handleRequest(
        * 与 /api/personalization 分开返回,是因为初始化一次就够 ——
        * 首页渲染不该等两次请求。
        */
-      personalization: await app.personalizationView(customerId),
+      personalization: await app.personalizationView(customerId, url.searchParams.get("sessionId") ?? undefined),
     });
     return;
   }

@@ -27,6 +27,7 @@ import {
   type LlmSelection,
 } from "../../llm/src/factory.ts";
 import { HashChainAudit } from "../../core/src/audit/hashChain.ts";
+import { buildCustomerDesk, type CustomerDesk } from "./desk.ts";
 import {
   buildTurnDecoration,
   deriveTemplate,
@@ -40,6 +41,7 @@ import type {
   SuggestionFacts,
 } from "../../core/src/agent/turnExtras.ts";
 import type { AuditEvent, CancellationState } from "../../core/src/types.ts";
+import { buildBillHealth, findIdleDemandInflow, fmtDate } from "../../core/src/capabilities/billAnalysis.ts";
 import { RuleSuggestionEngine } from "../../core/src/agent/suggestion.ts";
 import { deriveOperationStatus, type OperationStatus } from "../../core/src/agent/operationStatus.ts";
 import { PersonalizationStore } from "./personalization.ts";
@@ -350,11 +352,15 @@ export interface App {
     customerId: string;
     sessionId: string;
   }): Promise<{ saved: SavedFlowTemplate | null; reason?: string }>;
-  /** 首页个性化:常用流程 + 智能建议(含冷却过滤) */
-  personalizationView(customerId: string): Promise<{
+  /** 首页个性化:常用流程 + 智能建议(含冷却过滤) + 办事台 */
+  personalizationView(
+    customerId: string,
+    sessionId?: string,
+  ): Promise<{
     flows: Array<SavedFlowTemplate & { say: string }>;
     history: Array<{ ts: number; family: string; capability: string; amount?: number; subject?: string; completed: boolean }>;
     suggestions: Array<ProactiveSuggestion & { say: string }>;
+    desk: CustomerDesk;
   }>;
 }
 
@@ -622,13 +628,34 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
       return Date.UTC(y ?? 1970, (m ?? 1) - 1, 1) - 8 * 3600 * 1000;
     })();
 
-    const [txs, accounts, flows, profile, recent] = await Promise.all([
+    const [txs, accounts, flows, profile, recent, holdings] = await Promise.all([
       bank.listTransactions(customerId, { from: monthStart, to: now, direction: "out", limit: 300 }),
       bank.listAccounts(customerId),
       personalization.listFlows(customerId),
       bank.getRiskProfile(customerId),
       personalization.recentCapabilities(customerId, 30 * 24 * 3600 * 1000, now),
+      bank.listWealthHoldings(customerId),
     ]);
+    const maturityTimes = holdings
+      .map((h) => h.maturityAt)
+      .filter((t): t is number => typeof t === "number" && t >= now - 24 * 3600 * 1000)
+      .sort((a, b) => a - b);
+    const soonestMaturity = maturityTimes[0];
+    const soonestMaturityDays =
+      soonestMaturity == null ? null : Math.ceil((soonestMaturity - now) / (24 * 3600 * 1000));
+
+    const demandAccounts = accounts.filter((a) => a.type === "current" && a.status === "active");
+    const demandAvailable = Math.round(demandAccounts.reduce((s, a) => s + a.availableBalance, 0) * 100) / 100;
+    const demandIds = new Set(demandAccounts.map((a) => a.accountId));
+    const history = await bank.fetchForAnalysis(customerId, { from: now - 100 * 24 * 3600 * 1000, to: now });
+    const health = buildBillHealth(history, now);
+    const idle = findIdleDemandInflow(
+      history
+        .filter((t) => t.direction === "in" && demandIds.has(t.accountId))
+        .map((t) => ({ amount: t.amount, ts: t.ts, counterpartyName: t.counterpartyName })),
+      demandAvailable,
+      now,
+    );
 
     return {
       customerId,
@@ -649,6 +676,25 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
       recentCapabilities: recent,
       sessionCapabilities: [],
       wealthAssessed: profile.assessed && !profile.expired,
+      soonestMaturityDays,
+      billHealth: {
+        tag: health.tag,
+        tagLabel: health.tagLabel,
+        diningMonthlyAvg: health.diningMonthlyAvg,
+        surplusMonthlyAvg: health.surplusMonthlyAvg,
+        windowLabel: health.windowLabel,
+        reason: health.reason,
+      },
+      idleCash: idle
+        ? {
+            amount: idle.amount,
+            counterpartyName: idle.counterpartyName,
+            atLabel: fmtDate(idle.ts),
+            ageHours: Math.floor(idle.ageMs / (3600 * 1000)),
+            demandAvailable: idle.demandAvailable,
+            threshold: idle.threshold,
+          }
+        : null,
     };
   }
 
@@ -1128,12 +1174,32 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
      *   App 首页的同一块区域(常用服务)。分开两次请求会让界面出现
      *   "先显示常用流程、过一会儿又冒出一条建议"的抖动。
      */
-    async personalizationView(customerId: string) {
+    async personalizationView(customerId: string, sessionId?: string) {
       const nowTs = now();
       const flows = await personalization.listFlows(customerId);
       const facts = await buildFacts(customerId, nowTs);
       const suggestions = await suggestionEngine.suggest(facts);
       const allowed = await personalization.filterSuggestions(customerId, suggestions, nowTs);
+      const [subscriptions, holdings, products, schedules, risk] = await Promise.all([
+        bank.listSubscriptions(customerId),
+        bank.listWealthHoldings(customerId),
+        bank.listWealthProducts({}),
+        bank.listSchedules(customerId),
+        bank.getRiskProfile(customerId),
+      ]);
+      const desk = buildCustomerDesk({
+        now: nowTs,
+        pending: orchestrator.pending.listFor(customerId, nowTs),
+        subscriptions,
+        holdings,
+        products,
+        schedules,
+        plan: sessionId ? orchestrator.liveEventPlan(sessionId, nowTs) : null,
+        risk,
+        suggestions: allowed,
+        billHealth: facts.billHealth ?? null,
+        idleCash: facts.idleCash ?? null,
+      });
       return {
         flows: flows.map((f) => {
           const say = templateToSay(f);
@@ -1141,6 +1207,7 @@ export async function createApp(options: AppOptions = {}): Promise<App> {
         }),
         history: (await personalization.history(customerId)).slice(-20).reverse(),
         suggestions: allowed.map((s) => ({ ...s, say: s.say })),
+        desk,
       };
     },
   };

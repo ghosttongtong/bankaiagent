@@ -3577,6 +3577,438 @@ describe("Z3. 理财:输出侧合规闸门", () => {
   });
 });
 
+describe("Z11. 理财到期续接", () => {
+  test("★ 续接口令与到期问句落到方案,不落到申购或订阅", () => {
+    const cases: Array<{ say: string; action: string }> = [
+      { say: "看看这笔理财到期怎么续接", action: "wealth.rollover_plan" },
+      { say: "我的理财快到期了", action: "wealth.rollover_plan" },
+      { say: "续接第1个", action: "wealth.rollover_plan" },
+      { say: "不续投,留在活期", action: "wealth.rollover_plan" },
+      { say: "为什么没放固收", action: "wealth.rollover_plan" },
+      { say: "会员快到期了", action: "subscription.list" },
+      { say: "理财产品什么时候到期", action: "wealth.product_detail" },
+      { say: "帮我买1万块纯债添利", action: "wealth.purchase" },
+    ];
+    for (const c of cases) {
+      assert.equal(parseWithRules(c.say).intent.action, c.action, `「${c.say}」意图识别错误`);
+    }
+  });
+
+  test("★ 方案只放不高于原产品的在售产品,回撤与活期利率分列,不写预计下降", async () => {
+    const { buildRolloverPlan, evaluateRolloverFunds, detectYieldGapClaim } = await import(
+      "../packages/core/src/capabilities/wealth.ts"
+    );
+    const { enforceWealthWording } = await import("../packages/core/src/agent/orchestrator.ts");
+    const app = await makeApp();
+    const customerId = app.world.primaryCustomerId;
+    const [holdings, products, profile, rate] = await Promise.all([
+      app.bank.listWealthHoldings(customerId),
+      app.bank.listWealthProducts({ limit: 20 }),
+      app.bank.getRiskProfile(customerId),
+      app.bank.getDemandDepositRate(customerId),
+    ]);
+    const built = buildRolloverPlan({ customerId, holdings, products, profile, rate, now: Date.now() });
+    assert.equal(built.ok, true);
+    if (!built.ok) return;
+    assert.equal(built.plan.productCode, "LC1002");
+    assert.equal(built.plan.executed, false);
+    assert.deepEqual(
+      built.plan.candidates.map((c) => c.productCode),
+      ["LC1002", "LC1003", "LC1001"],
+    );
+    assert.ok(built.plan.excluded.some((e) => e.productCode === "LC2001" && /高于/.test(e.reason)));
+    assert.match(built.plan.summary, /近 6 个月最大回撤/);
+    assert.match(built.plan.summary, /挂牌年利率 0\.20%/);
+    assert.match(built.plan.summary, /口径不同/);
+    assert.equal(detectYieldGapClaim(built.plan.summary).length, 0, "方案正文自己踩了落差口号");
+    assert.match(built.plan.summary, /也不给综合最优/);
+    assert.doesNotMatch(built.plan.summary, /加息券|预计年化收益下降/);
+
+    const waiting = evaluateRolloverFunds({
+      now: Date.now(),
+      maturityAt: built.plan.maturityAt,
+      disposition: "to_demand",
+      credited: false,
+      availableBalance: 1_000_000,
+      amount: built.plan.amountBasis,
+    });
+    assert.equal(waiting.ready, false);
+    assert.equal(waiting.code, "awaiting_maturity");
+
+    const held = evaluateRolloverFunds({
+      now: built.plan.maturityAt + 1000,
+      maturityAt: built.plan.maturityAt,
+      disposition: "to_demand",
+      credited: false,
+      availableBalance: built.plan.amountBasis,
+      amount: built.plan.amountBasis,
+    });
+    assert.equal(held.code, "still_held");
+
+    const ready = evaluateRolloverFunds({
+      now: built.plan.maturityAt + 1000,
+      maturityAt: built.plan.maturityAt,
+      disposition: "to_demand",
+      credited: true,
+      availableBalance: built.plan.amountBasis,
+      amount: built.plan.amountBasis,
+    });
+    assert.equal(ready.ready, true);
+
+    const auto = evaluateRolloverFunds({
+      now: built.plan.maturityAt + 1000,
+      maturityAt: built.plan.maturityAt,
+      disposition: "auto_rollover",
+      credited: true,
+      availableBalance: built.plan.amountBasis,
+      amount: built.plan.amountBasis,
+    });
+    assert.equal(auto.code, "auto_rollover");
+
+    const rewritten = enforceWealthWording("若转出至活期,预计年化收益下降 2%。理财非存款,产品有风险。");
+    assert.doesNotMatch(rewritten.text, /下降\s*2%/);
+    assert.match(rewritten.text, /不能相减|少拿/);
+    assert.match(rewritten.text, /理财非存款/);
+    assert.equal(detectYieldGapClaim("这两个百分比口径不同,不能相减后当成您将少拿的钱。").length, 0);
+  });
+
+  test("★ 对话里选定续接只登记,不冻结、不申购、不出确认卡", async () => {
+    const app = await makeApp();
+    const sessionId = freshSession();
+    const customerId = app.world.primaryCustomerId;
+    const beforeAccounts = await app.bank.listAccounts(customerId);
+    const before = beforeAccounts.find((a) => a.type === "current")!;
+    const beforeHolding = (await app.bank.listWealthHoldings(customerId)).find((h) => h.productCode === "LC1002")!;
+
+    const plan = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "看看这笔理财到期怎么续接", sessionId }),
+    );
+    assert.match(plan.reply, /到期续接方案/);
+    assert.match(plan.reply, /1\. 稳健增利90天/);
+    assert.match(plan.reply, /2\. 纯债添利B/);
+    assert.match(plan.reply, /3\. 天天利货币A/);
+    assert.match(plan.reply, /不会申购/);
+    assert.match(plan.reply, /接下来可以直接说/);
+    assert.match(plan.reply, /「第2个怎么样」/);
+    assert.match(plan.reply, /「为什么没放固收」/);
+    assert.match(plan.reply, /「续接第1个」/);
+    assert.match(plan.reply, /「不续投」/);
+    assert.doesNotMatch(plan.reply, /[123]\. (固收|科技|沪深|大额存单)/);
+    assert.equal(app.orchestrator.pending.latestFor(customerId, Date.now()) ?? null, null);
+
+    const detail = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "第2个怎么样", sessionId }),
+    );
+    assert.match(detail.reply, /纯债添利B/);
+    assert.match(detail.reply, /近 6 个月最大回撤/);
+    assert.doesNotMatch(detail.reply, /接下来可以直接说/);
+
+    const compared = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "第1个和第2个比一下", sessionId }),
+    );
+    assert.match(compared.reply, /稳健增利90天/);
+    assert.match(compared.reply, /纯债添利B/);
+    assert.match(compared.reply, /不替您下/);
+    assert.doesNotMatch(compared.reply, /接下来可以直接说/);
+
+    const leftOut = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "为什么没放固收", sessionId }),
+    );
+    assert.match(leftOut.reply, /固收\+双利180天/);
+    assert.match(leftOut.reply, /高于/);
+    assert.match(leftOut.reply, /不是因为收益低/);
+    assert.match(leftOut.reply, /「第2个怎么样」/);
+    assert.equal(app.orchestrator.pending.latestFor(customerId, Date.now()) ?? null, null);
+
+    const missed = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "续接第9个", sessionId }),
+    );
+    assert.match(missed.reply, /没有第 9 个/);
+    assert.equal(await app.bank.getRolloverChoice(customerId, beforeHolding.holdingId), null);
+
+    const chosen = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "买第1个", sessionId }),
+    );
+    assert.match(chosen.reply, /没有申购/);
+    assert.match(chosen.reply, /没有冻结|现在没有冻结/);
+    assert.equal(app.orchestrator.pending.latestFor(customerId, Date.now()) ?? null, null);
+    const choice = await app.bank.getRolloverChoice(customerId, beforeHolding.holdingId);
+    assert.ok(choice);
+    assert.equal(choice!.decision, "renew");
+    assert.equal(choice!.productCode, "LC1002");
+    assert.equal(choice!.status, "awaiting_credit");
+
+    const after = (await app.bank.listAccounts(customerId)).find((a) => a.type === "current")!;
+    assert.equal(after.availableBalance, before.availableBalance);
+    const holdingAfter = (await app.bank.listWealthHoldings(customerId)).find((h) => h.productCode === "LC1002")!;
+    assert.equal(holdingAfter.shares, beforeHolding.shares);
+
+    const events = await app.audit.readAll();
+    const generated = events.find((e) => e.type === "wealth_rollover_plan_generated");
+    assert.equal(generated?.payload["executed"], false);
+    const recorded = events.find((e) => e.type === "wealth_rollover_choice_recorded");
+    assert.equal(recorded?.payload["purchased"], false);
+
+    const stay = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "不续投", sessionId }),
+    );
+    assert.match(stay.reply, /不续投/);
+    const stayed = await app.bank.getRolloverChoice(customerId, beforeHolding.holdingId);
+    assert.equal(stayed?.decision, "stay_demand");
+    assert.equal(stayed?.status, "declined");
+    const afterStay = (await app.bank.listAccounts(customerId)).find((a) => a.type === "current")!;
+    assert.equal(afterStay.availableBalance, before.availableBalance);
+
+    await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "续接第1个", sessionId }));
+    assert.equal((await app.bank.getRolloverChoice(customerId, beforeHolding.holdingId))?.decision, "renew");
+
+    const tooEarly = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "按续接方案申购", sessionId }),
+    );
+    assert.match(tooEarly.reply, /没有申购/);
+    assert.equal(app.orchestrator.pending.latestFor(customerId, Date.now()) ?? null, null);
+
+    const booked = [...app.world.wealthHoldings.values()].find((h) => h.productCode === "LC1002");
+    assert.ok(booked);
+    booked!.maturityAt = Date.now() - 60_000;
+    booked!.maturityCredited = true;
+    const afterCredit = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "按续接方案申购", sessionId }),
+    );
+    assert.match(afterCredit.reply, /风险测评/);
+    assert.equal(app.orchestrator.pending.latestFor(customerId, Date.now()) ?? null, null);
+    const still = (await app.bank.listAccounts(customerId)).find((a) => a.type === "current")!;
+    assert.equal(still.availableBalance, before.availableBalance);
+  });
+
+  test("★ 理财列表还在时,「2」仍然是在选第二个张伟", async () => {
+    const app = await makeApp();
+    const sessionId = freshSession();
+    await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "看看这笔理财到期怎么续接", sessionId }),
+    );
+    const catalog = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "有什么理财产品", sessionId }),
+    );
+    assert.match(catalog.reply, /固收|科技|沪深|大额存单/);
+    assert.doesNotMatch(catalog.reply, /接下来可以直接说/);
+
+    const ask = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "取消网易云会员和给张伟转1500", sessionId }),
+    );
+    assert.equal(ask.promptFor?.kind, "clarify", ask.reply);
+    assert.match(ask.reply, /张伟/);
+    const second = ask.promptFor?.candidates?.[1];
+    assert.ok(second, "没有第二个张伟");
+
+    const picked = await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "2", sessionId }));
+    assert.match(picked.reply, /已确认第 1 步收款人/);
+    assert.match(picked.reply, /网易云/);
+    assert.match(picked.reply, /回复「确认」/);
+    assert.doesNotMatch(picked.reply, /纯债添利|产品详情|到期续接方案/);
+    const bank = second!.subLabel?.split(" · ")[0];
+    assert.ok(bank);
+    assert.match(picked.reply, new RegExp(bank!));
+    assert.match(picked.reply, /自动接着办下一件/);
+
+    const continued = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "确认", sessionId }),
+    );
+    assert.match(continued.reply, /上一件已经办完/);
+    assert.match(continued.reply, /张伟/);
+    assert.match(continued.reply, /1,500|1500/);
+    assert.doesNotMatch(continued.reply, /分开告诉我/);
+
+    const session2 = freshSession();
+    await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "看看这笔理财到期怎么续接", sessionId: session2 }),
+    );
+    const onlyTransfer = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "给张伟转1500", sessionId: session2 }),
+    );
+    assert.equal(onlyTransfer.promptFor?.kind, "clarify");
+    const pickedTransfer = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "2", sessionId: session2 }),
+    );
+    assert.match(pickedTransfer.reply, /已确认收款人/);
+    assert.doesNotMatch(pickedTransfer.reply, /纯债添利|产品详情|到期续接方案/);
+  });
+
+  test("★ 办事台点进去是续接方案,7 天内才给建议", async () => {
+    const { suggestWealthMaturity } = await import("../packages/core/src/agent/suggestion.ts");
+    const app = await makeApp();
+    const view = await app.personalizationView(app.world.primaryCustomerId);
+    const maturity = view.desk.actions.find((a) => a.kind === "maturity");
+    assert.ok(maturity, "办事台没有到期条目");
+    assert.equal(maturity!.say, "看看这笔理财到期怎么续接");
+    assert.match(maturity!.detail, /不会申购/);
+    assert.match(view.suggestions.map((s) => s.ruleId).join(","), /SUG-WEALTH-MATURITY/);
+
+    assert.equal(
+      suggestWealthMaturity({
+        customerId: "c",
+        displayName: "测",
+        now: 0,
+        monthExpense: 0,
+        monthExpenseCount: 0,
+        availableBalance: 10_000,
+        savedFlows: [],
+        recentCapabilities: [],
+        sessionCapabilities: [],
+        wealthAssessed: false,
+        soonestMaturityDays: 30,
+      }),
+      null,
+    );
+  });
+});
+
+describe("Z12. 账单标签与活期入账", () => {
+  test("三档标签只跟客户自己的流水和门槛比", async () => {
+    const { buildBillHealth, findIdleDemandInflow } = await import("../packages/core/src/capabilities/billAnalysis.ts");
+    const tx = (
+      ts: number,
+      direction: "in" | "out",
+      amount: number,
+      category: string,
+    ) => ({
+      transactionId: `t-${ts}-${direction}-${amount}`,
+      accountId: "a",
+      direction,
+      amount,
+      currency: "CNY",
+      counterpartyName: "对手",
+      category,
+      balanceAfter: 0,
+      ts,
+    });
+    const at = (iso: string) => Date.parse(iso);
+    const now = at("2026-10-28T12:00:00+08:00");
+
+    const dining = buildBillHealth(
+      [
+        tx(at("2026-08-05T12:00:00+08:00"), "in", 10_000, "工资收入"),
+        tx(at("2026-08-06T12:00:00+08:00"), "out", 3_000, "餐饮美食"),
+        tx(at("2026-08-07T12:00:00+08:00"), "out", 1_000, "交通出行"),
+        tx(at("2026-09-05T12:00:00+08:00"), "in", 10_000, "工资收入"),
+        tx(at("2026-09-06T12:00:00+08:00"), "out", 3_000, "餐饮美食"),
+        tx(at("2026-09-07T12:00:00+08:00"), "out", 1_000, "交通出行"),
+      ],
+      now,
+    );
+    assert.equal(dining.tag, "dining_high");
+    assert.equal(dining.diningMonthlyAvg, 3000);
+    assert.match(dining.reason, /餐饮美食/);
+    assert.match(dining.reason, /15%/);
+
+    const tight = buildBillHealth(
+      [
+        tx(at("2026-08-05T12:00:00+08:00"), "in", 1_000, "工资收入"),
+        tx(at("2026-08-06T12:00:00+08:00"), "out", 950, "日用百货"),
+        tx(at("2026-09-05T12:00:00+08:00"), "in", 1_000, "工资收入"),
+        tx(at("2026-09-06T12:00:00+08:00"), "out", 950, "日用百货"),
+      ],
+      now,
+    );
+    assert.equal(tight.tag, "spending_near_income");
+    assert.match(tight.reason, /支出是收入的/);
+
+    const steady = buildBillHealth(
+      [
+        tx(at("2026-08-05T12:00:00+08:00"), "in", 10_000, "工资收入"),
+        tx(at("2026-08-06T12:00:00+08:00"), "out", 100, "餐饮美食"),
+        tx(at("2026-08-07T12:00:00+08:00"), "out", 1_900, "交通出行"),
+        tx(at("2026-09-05T12:00:00+08:00"), "in", 10_000, "工资收入"),
+        tx(at("2026-09-06T12:00:00+08:00"), "out", 100, "餐饮美食"),
+        tx(at("2026-09-07T12:00:00+08:00"), "out", 1_900, "交通出行"),
+      ],
+      now,
+    );
+    assert.equal(steady.tag, "surplus_stable");
+    assert.ok(steady.surplusMonthlyAvg >= 3000);
+
+    const thin = buildBillHealth(
+      [tx(at("2026-09-05T12:00:00+08:00"), "in", 10_000, "工资收入")],
+      now,
+    );
+    assert.equal(thin.tag, "none");
+
+    const t0 = 1_700_000_000_000;
+    assert.equal(
+      findIdleDemandInflow([{ amount: 6000, ts: t0 - 3600 * 1000, counterpartyName: "公司" }], 8000, t0),
+      null,
+    );
+    const parked = findIdleDemandInflow(
+      [{ amount: 6000, ts: t0 - 72 * 3600 * 1000, counterpartyName: "公司" }],
+      8000,
+      t0,
+    );
+    assert.equal(parked?.amount, 6000);
+    assert.equal(parked?.counterpartyName, "公司");
+    assert.equal(
+      findIdleDemandInflow([{ amount: 6000, ts: t0 - 40 * 24 * 3600 * 1000, counterpartyName: "公司" }], 8000, t0),
+      null,
+    );
+    assert.equal(
+      findIdleDemandInflow([{ amount: 6000, ts: t0 - 72 * 3600 * 1000, counterpartyName: "公司" }], 1000, t0),
+      null,
+    );
+  });
+
+  test("★ 演示客户的标签和入账提示用的是他自己的流水", async () => {
+    const app = await makeApp();
+    const sessionId = freshSession();
+    const before = [...app.world.accounts.values()].find(
+      (a) => a.customerId === app.world.primaryCustomerId && a.type === "current",
+    );
+    const balanceBefore = before?.availableBalance;
+
+    const view = await app.personalizationView(app.world.primaryCustomerId);
+    const idle = view.desk.notices.find((n) => n.id === "idle_cash");
+    assert.ok(idle, "办事台没有活期入账提示");
+    assert.equal(idle!.say, "有哪些货币基金");
+    assert.match(idle!.title, /28,650\.00/);
+    assert.match(idle!.detail, /不是存款/);
+    assert.match(idle!.detail, /不会申购/);
+    const healthNotice = view.desk.notices.find((n) => n.id === "bill_health");
+    assert.ok(healthNotice, "办事台没有财务健康标签");
+    assert.equal(healthNotice!.say, "看看财务健康标签");
+
+    const labeled = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "看看财务健康标签", sessionId }),
+    );
+    assert.match(labeled.reply, /财务健康标签/);
+    assert.match(labeled.reply, /餐饮/);
+    assert.match(labeled.reply, /月均结余/);
+    assert.match(labeled.reply, /没有创建定投/);
+    assert.doesNotMatch(labeled.reply, /同收入|中位数|可释放|稳赚|高收益/);
+    assert.equal(labeled.promptFor?.kind ?? "none", "none");
+
+    const dining = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "近三个月餐饮花了多少", sessionId }),
+    );
+    assert.match(dining.reply, /餐饮美食/);
+    assert.match(dining.reply, /合计/);
+    assert.doesNotMatch(dining.reply, /财务健康标签/);
+
+    const cashflow = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "近三个月收支", sessionId }),
+    );
+    assert.match(cashflow.reply, /收支分析\(近 3 个月\)/);
+    assert.match(cashflow.reply, /结余/);
+
+    const funds = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "有哪些货币基金", sessionId }),
+    );
+    assert.match(funds.reply, /天天利货币A/);
+    assert.match(funds.reply, /理财非存款/);
+    assert.doesNotMatch(funds.reply, /大额存单/);
+    assert.equal(funds.promptFor?.kind ?? "none", "none");
+    const balanceAfter = [...app.world.accounts.values()].find((a) => a.accountId === before?.accountId)?.availableBalance;
+    assert.equal(balanceAfter, balanceBefore);
+  });
+});
+
 describe("Z3. 理财:规则必须能扩展到新场景(架构通用性)", () => {
   test("★ 转账的分档规则不得套用到无对手方的资金操作上", async () => {
     const { evaluatePolicy, buildDefaultRegistry } = await import("../packages/core/src/index.ts");
