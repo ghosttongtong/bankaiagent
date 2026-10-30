@@ -71,6 +71,9 @@ export function buildIntentSystemPrompt(input: {
 - "给我点省钱建议" / "分析下我的消费习惯" / "账单有什么问题" → account.insights
 - "看看财务健康标签" / "我的账单标签" → account.health_label。这是近几个月流水打的标签,不要填预期收益,不要写成已经申购或已经定投
 - "帮我规划这个月预算" / "这个月还剩多少能花" / "预算5000够不够" / "每天能花多少" → account.budget_plan
+- ★ **「工资刚到账,帮我理一下这个月该怎么分配」** / 「发薪后该怎么花钱」 / 「工资到了帮我安排一下怎么分」→ **account.payday_brief**
+  这是**发薪分配清单**(工资入账 + 固定扣款 + 粗算可自由支配 + 续办按钮),**不是** account.analysis / account.report。
+  句子里有「分配/理一下/怎么花」且在说工资到账时,**禁止**判成「本月花了多少」。
 - "帮我比对这几份材料" / "合同和发票金额对不上" / "这几份单据有没有矛盾" → document.compare
 - "再扫一遍异常" / "还有没有漏的异常" / "重新检查一下可疑交易" → account.review_anomalies
 - "这条是误报" / "这笔是我自己的,不算异常" / "把第2条异常撤掉" → account.anomaly_withdraw
@@ -179,9 +182,11 @@ export function buildIntentSystemPrompt(input: {
 说一句"下个月15号有个重要纪念日帮我规划下",系统要同时看账单、资金与外部商户。
 因此本场景的动作被刻意拆成**生成方案**与**执行某一步**两组 —— 绝不允许合并。
 
+- ★ **「工资到账 / 发薪 + 理一下怎么分配」→ account.payday_brief**,不是 cross_scene_event_planning。
 - **"我下个月15号有个重要纪念日帮我规划下"** / "下个月我生日,帮我安排一下" /
-  "最近有什么大额支出需要提前准备" / "下周发工资,帮我规划一下" /
+  "最近有什么大额支出需要提前准备" /
   "下个月想出去玩,帮我安排" → **cross_scene_event_planning**
+  (「下周发工资帮我规划一下」若重点是**分配工资**,用 account.payday_brief)
   ★ 这是**只出方案**:系统会把方案摆出来(哪几步、每步多少钱、去哪),
   但一步都不执行。绝对不要用"已经帮你安排好了"这类话复述。
 - "你能帮我规划什么" / "有哪些关键事件" / "我有哪些重要日子" → event.list
@@ -498,7 +503,8 @@ export async function parseIntent(options: ParseIntentOptions): Promise<ParseInt
     if (result.ok) {
       // 归一化:填入 Schema 默认值,后续代码只面对完整形态
       const normalized = ParsedRequestSchema.parse(result.value);
-      const parsed = fillMissingPlanFromRules(options.userText, options.context.nowIso, normalized);
+      const filled = fillMissingPlanFromRules(options.userText, options.context.nowIso, normalized);
+      const parsed = applyRulePriorityOverrides(options.userText, options.context.nowIso, filled);
       return {
         ok: true,
         parsed,
@@ -537,6 +543,30 @@ function fillMissingPlanFromRules(userText: string, nowIso: string, parsed: Pars
   const rules = parseWithRules(userText, Number.isFinite(now) ? now : Date.now());
   if (!rules.multiIntent || rules.multiIntent.items.length < 2) return parsed;
   return { ...parsed, multiIntent: rules.multiIntent };
+}
+
+/**
+ * 规则优先覆盖:少数意图 LLM 常误判,但规则层有明确判据 —— 以规则为准并留痕在 intent 上。
+ */
+const RULE_OVERRIDE_ACTIONS = new Set<string>(["account.payday_brief"]);
+
+function applyRulePriorityOverrides(userText: string, nowIso: string, parsed: ParsedRequest): ParsedRequest {
+  if ((parsed.multiIntent?.items.length ?? 0) >= 2) return parsed;
+  const now = Date.parse(nowIso);
+  const rules = parseWithRules(userText, Number.isFinite(now) ? now : Date.now());
+  const ruleAction = rules.intent.action;
+  if (!RULE_OVERRIDE_ACTIONS.has(ruleAction)) return parsed;
+  if (parsed.intent.action === ruleAction) return parsed;
+  return {
+    ...parsed,
+    intent: {
+      ...rules.intent,
+      confidence: Math.max(rules.intent.confidence ?? 0.9, parsed.intent.confidence ?? 0, 0.92),
+      restatedIntent:
+        rules.intent.restatedIntent ||
+        "用户想在工资到账后看清固定支出与可自由支配金额(发薪分配清单,只读汇总)",
+    },
+  };
 }
 
 function deterministicFallback(

@@ -30,6 +30,7 @@
  */
 
 import type { Channel } from "../types.ts";
+import { compactRichListReply } from "./brevity.ts";
 
 // ============================================================================
 // 来源标注
@@ -235,9 +236,114 @@ export interface BillChartVisual {
   notes: string[];
   /** 下载文件名(含 .png) */
   filename: string;
+  compactBody?: string;
 }
 
-export type VisualBlock = DocDiffVisual | ReviewPlanVisual | RetractionVisual | BillChartVisual;
+export type VisualBlock =
+  | DocDiffVisual
+  | ReviewPlanVisual
+  | RetractionVisual
+  | BillChartVisual
+  | AnomalyReportVisual
+  | ListReportVisual
+  | QuizStepVisual;
+
+/** 风险测评等逐题作答:一题一卡,选项可点选。 */
+export interface QuizStepVisual {
+  kind: "quiz_step";
+  title: string;
+  progress: string;
+  question: string;
+  options: Array<{ optionId: string; label: string; say: string }>;
+  compactBody?: string;
+}
+
+/**
+ * 通用清单卡 —— 余额账户、交易流水、定期支出、定时任务、AA 记录、卡列表共用。
+ *
+ * ★ 为什么不做成一种场景一种卡:这些报告的差异只在「条目上有几行字、什么色调」,
+ *   结构完全一样。一个渲染器 + 各能力填数据,新增一类报告不必再动前端。
+ *
+ * ★ compactBody 是给富交互终端的短正文:明细已经在卡片里了,正文只留结论。
+ *   CLI / IM 没有卡片,仍然使用能力原本那份完整文本 —— 同一份数据,两种讲法。
+ *    tone/badge 只是展示层着色,等级与结论一律由能力侧算好。
+ */
+export interface ListReportVisual {
+  kind: "list_report";
+  /** 卡片标题,如「账户余额」「交易流水」 */
+  title: string;
+  /** 副标题:时间窗、笔数等一句话口径 */
+  subtitle?: string;
+  /** 结论句,放在条目之前 */
+  summary?: string;
+  items: {
+    /** 条目标题,如「活期账户(****1234)」「华强北数码城」 */
+    title: string;
+    /** 右侧主数值,如「¥1,234.56」;不需要就省略 */
+    value?: string;
+    /** 标题旁的徽章文字,如「支出」「每月」 */
+    badge?: string;
+    /** 色调:high 红 / medium 琥珀 / ok 绿 / plain 灰,默认 plain */
+    tone?: "high" | "medium" | "low" | "ok" | "plain";
+    /** 条目下的补充行(依据、日期、备注) */
+    lines?: string[];
+  }[];
+  /** 富交互终端的短正文;没有卡片能力的渠道仍用完整文本 */
+  compactBody?: string;
+  /** 卡片末尾的补充说明(口径、止损路径等) */
+  footer?: string;
+  /** 可点选动作(如「1」「2」选产品),与正文里的指令词一致 */
+  actions?: Array<{ label: string; say: string }>;
+  /** 横向柱图(如持仓市值构成),数字由能力侧算好 */
+  bars?: Array<{ label: string; value: number; tone?: "high" | "medium" | "low" | "ok" | "plain" }>;
+}
+
+/**
+ * 富交互终端的客户可见正文:有卡片/图表时用短结论,完整 summary 仍留在能力与 CLI。
+ */
+export function richCustomerReply(extras: TurnExtras | undefined, fallback: string): string {
+  if (!extras?.richUi) return fallback;
+  const v = extras.visual;
+  if (!v) return fallback;
+  if ("compactBody" in v && typeof v.compactBody === "string" && v.compactBody.trim()) {
+    return v.compactBody.trim();
+  }
+  if (v.kind === "bill_chart") {
+    const lead = [v.title, v.subtitle].filter(Boolean).join(" · ");
+    const note = v.notes?.[0]?.trim();
+    return (note ? `${lead} — ${note}` : lead) || fallback;
+  }
+  if (v.kind === "anomaly_report") return v.summary.trim() || fallback;
+  if (v.kind === "doc_diff") return v.verdict.trim() || fallback;
+  if (v.kind === "quiz_step") {
+    return v.compactBody?.trim() || `${v.progress} · 请点选一项`.trim();
+  }
+  if (v.kind === "review_plan") {
+    return v.decisionLabel?.trim() || fallback;
+  }
+  return compactRichListReply(fallback);
+}
+
+/**
+ * 异常交易清单。
+ *
+ * ★ 等级、依据、建议全部来自检测能力,界面只负责分级着色与排版 ——
+ *   「这条算不算高危」永远不是前端能决定的事。
+ *   advice 与 CLI 正文可以不同措辞:有按钮的终端不必教客户打字。
+ */
+export interface AnomalyReportVisual {
+  kind: "anomaly_report";
+  windowLabel: string;
+  checkedCount: number;
+  summary: string;
+  items: {
+    severity: string;
+    title: string;
+    description: string;
+    advice: string;
+    dateLabel: string;
+  }[];
+}
 
 /** 去掉空图,并收成安全文件名。没有可画的柱时返回 null。 */
 export function billChartVisual(input: Omit<BillChartVisual, "kind">): BillChartVisual | null {
@@ -249,11 +355,16 @@ export function billChartVisual(input: Omit<BillChartVisual, "kind">): BillChart
     .filter((panel) => panel.series.length > 0);
   if (panels.length === 0) return null;
   const filename = `${input.filename.replace(/[\\/:*?"<>|]/g, "-").replace(/\.png$/i, "")}.png`;
+  const compactBody =
+    input.compactBody?.trim() ||
+    [input.title, input.subtitle].filter(Boolean).join(" · ") ||
+    undefined;
   return {
     kind: "bill_chart",
     title: input.title,
     subtitle: input.subtitle,
     panels,
+    ...(compactBody ? { compactBody } : {}),
     notes: input.notes.map((note) => note.trim()).filter((note) => note.length > 0),
     filename,
   };

@@ -705,6 +705,60 @@ export const EVENT_TRIGGERS: EventTriggerDef[] = [
     },
   },
   {
+    id: "evt_theme_park",
+    kind: "travel",
+    kindLabel: "主题乐园",
+    keywords: /(迪士尼|迪斯尼|游乐园|主题公园|欢乐谷|环球影城|买门票|订门票)/,
+    leadDays: 14,
+    placesExternalOrder: true,
+    mounts: "余额与扣款核对 → 锁定游玩预算 → 官方渠道门票预约",
+    build: (data, event) => {
+      const { account, total } = availableFunds(data.accounts);
+      const budget = suggestBudget(data, event.budgetHint);
+      const ticketBudget = Math.max(budget.amount, 800);
+      const park = pickMerchant(data.merchants, "theme_park", event.leadDays);
+      const steps: EventPlanStep[] = [];
+
+      steps.push(
+        readStep({
+          triggerId: event.triggerId,
+          index: 0,
+          title: "出行前:扣款日与可动用余额",
+          detail:
+            `可动用余额 ¥${fmtEventMoney(total)};到游玩日前后 7 天已知固定扣款 ` +
+            `${upcomingFixedOutflows(data, event.occursAt - DAY_MS, event.occursAt + 7 * DAY_MS).length} 笔。`,
+          evidence: [`可动用余额:¥${fmtEventMoney(total)}`],
+          executed: true,
+        }),
+      );
+      steps.push(
+        fundStep({
+          triggerId: event.triggerId,
+          index: steps.length,
+          title: "锁定「主题乐园」游玩预算",
+          detail: `预留 ¥${fmtEventMoney(ticketBudget)}(${budget.basis}),含门票与园内消费缓冲。`,
+          capability: "event.fund_step",
+          leg: fundsLeg(account, "主题乐园游玩预算", ticketBudget, event.occursAt),
+          when: `${fmtEventDay(event.occursAt)}(计划入园日)`,
+          evidence: [`预算口径:${budget.basis}`],
+        }),
+      );
+      if (park) {
+        steps.push(
+          merchantStep(event.triggerId, steps.length, park, {
+            amount: Math.max(park.minAmount * 2, 950),
+            from: account,
+            scheduledAt: event.occursAt,
+            when: `${fmtEventDay(event.occursAt)}(入园日)`,
+            why: "门票须走合作商户目录,金额与退改政策以商户公示为准,下单前会单独确认。",
+            now: data.now,
+          }),
+        );
+      }
+      return steps;
+    },
+  },
+  {
     id: "evt_travel",
     kind: "travel",
     kindLabel: "出行",
@@ -1035,6 +1089,39 @@ export function checkFundDisclosure(steps: EventPlanStep[]): DisclosureGap[] {
     if (!s.disclosure || s.disclosure.trim().length === 0) gaps.push({ stepId: s.stepId, domain: s.domain, reason: "没有可展示的披露口径" });
   }
   return gaps;
+}
+
+/** 联动方案清单卡:步骤徽章与色调(富 UI 展示用) */
+export function eventPlanStepListBadge(step: EventPlanStep): string {
+  if (step.domain === "read" || step.tier === "auto") return "只读";
+  if (step.tier === "strong_auth") return "强验证";
+  if (step.tier === "confirm") return "待确认";
+  return step.tierLabel;
+}
+
+export function eventPlanStepListTone(step: EventPlanStep): "high" | "medium" | "ok" | "plain" {
+  if (step.domain === "read" || step.tier === "auto") return "ok";
+  if (step.tier === "strong_auth") return "high";
+  if (step.tier === "confirm") return "medium";
+  return "plain";
+}
+
+/** 方案生成后,给客户的一键续办话术(与 renderEventPlan 末尾一致) */
+export function eventPlanFollowUpActions(plan: EventPlan): Array<{ label: string; say: string }> {
+  const actions: Array<{ label: string; say: string }> = [];
+  const fund = plan.steps.find((s) => s.domain === "fund" && s.executable);
+  const external = plan.steps.find((s) => s.domain === "external" && s.executable);
+  if (fund) actions.push({ label: "办资金那一步", say: "执行资金操作" });
+  if (external) {
+    let say = "执行外部操作";
+    if (/鲜花|花束|玫瑰/.test(external.title)) say = "帮我订花";
+    else if (/蛋糕/.test(external.title)) say = "帮我订蛋糕";
+    else if (/酒店|住宿/.test(external.title)) say = "帮我订酒店";
+    else if (/主题乐园|门票|迪士尼|游乐园/.test(external.title)) say = "帮我订门票";
+    const label = external.title.length > 14 ? `${external.title.slice(0, 14)}…` : external.title;
+    actions.push({ label, say });
+  }
+  return actions;
 }
 
 // ============================================================================

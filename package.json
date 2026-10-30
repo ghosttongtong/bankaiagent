@@ -21,21 +21,10 @@
     "demo": "node packages/cli/src/demo.ts",
     "chat": "node packages/cli/src/chat.ts",
     "dev": "node packages/server/src/index.ts",
-    "gateway": "node packages/server/src/index.ts",
-    "probe": "node packages/cli/src/probeCapabilities.ts",
-    "check-llm": "node packages/cli/src/diagnoseLlm.ts",
-    "verify-audit": "node packages/cli/src/verifyAudit.ts",
-    "label-outcomes": "node packages/cli/src/labelOutcomes.ts",
-    "train-scorer": "node packages/cli/src/trainScorer.ts",
-    "scorer-report": "node packages/cli/src/scorerReport.ts",
     "verify-app": "node tools/verify-flows.mjs",
     "verify-auth": "node tools/verify-auth.mjs",
-    "verify-extras": "node tools/verify-extras.mjs",
-    "verify-gateway": "node tools/verify-gateway-extras.mjs",
-    "verify-sessions": "node tools/verify-sessions.mjs",
     "verify-rag": "node tools/verify-rag.mjs",
-    "check-web": "node tools/check-web-ui.mjs",
-    "cleanup-var": "node tools/cleanup-var.mjs"
+    "check-web": "node tools/check-web-ui.mjs"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

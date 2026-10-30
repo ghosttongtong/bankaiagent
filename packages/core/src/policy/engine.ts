@@ -479,6 +479,47 @@ export function mapScoreToTier(score: number): Tier {
   return "auto";
 }
 
+/**
+ * 面向界面的风险视图(三段刻度盘的数据源)。
+ *
+ * ★ 为什么在服务端组装,而不是让前端去 policySummary 里翻:
+ *   「R-RISK-SCORE 这条代表评分」「28/62 是分档线」都属于**业务规则**。
+ *   前端若自己认识 ruleId、自己写死阈值,就等于把风控规则复制了一份到界面层 ——
+ *   改一次阈值要改两处,而且界面与裁决迟早各说各话。
+ *   所以这里一次性把「分数 + 各因子贡献 + 阈值 + 最终档位」打包成纯展示数据。
+ *
+ * 数据源就是已落审计的那条 R-RISK-SCORE 理由:界面上看到的分数,
+ * 与审计链里这条裁决的分数必然是同一个数(同一份数据的两种渲染)。
+ *
+ * 没有评分理由时返回 null(例如只读能力根本没走到评分这一步),界面据此不画。
+ */
+export interface RiskView {
+  /** 0–100 总分 */
+  score: number;
+  /** 最终生效档位(可能被强制升级,故以裁决结果为准而非 tierFromScore) */
+  tier: Tier;
+  /** 各因子贡献,用于展开解释"这一分是怎么来的" */
+  factors: RiskFactor[];
+  /** 分档阈值,界面画刻度线用 */
+  thresholds: { auto: number; confirm: number };
+}
+
+export function buildRiskView(
+  reasons: PolicyReason[] | undefined,
+  tier: Tier,
+): RiskView | null {
+  const scored = reasons?.find((r) => r.ruleId === "R-RISK-SCORE");
+  const score = scored?.evidence?.["score"];
+  if (typeof score !== "number") return null;
+  const rawFactors = scored?.evidence?.["factors"];
+  return {
+    score,
+    tier,
+    factors: Array.isArray(rawFactors) ? (rawFactors as RiskFactor[]) : [],
+    thresholds: { auto: RISK_THRESHOLDS.auto, confirm: RISK_THRESHOLDS.confirm },
+  };
+}
+
 // ============================================================================
 // 第 4 项:评分器升级 —— 特征抽取(标签管道与影子模式的地基)
 // ============================================================================

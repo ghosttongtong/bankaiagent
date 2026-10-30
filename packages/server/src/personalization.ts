@@ -204,9 +204,14 @@ export class PersonalizationStore {
   async saveFlow(customerId: string, template: SavedFlowTemplate): Promise<SavedFlowTemplate> {
     const file = await this.load(customerId);
     const existing = file.flows.find((f) => f.templateId === template.templateId);
-    const merged: SavedFlowTemplate = existing
-      ? { ...template, createdAt: existing.createdAt, useCount: existing.useCount, ...(existing.lastUsedAt ? { lastUsedAt: existing.lastUsedAt } : {}) }
-      : template;
+    const now = Date.now();
+    const merged: SavedFlowTemplate = {
+      ...template,
+      createdAt: existing?.createdAt ?? template.createdAt ?? now,
+      useCount: existing?.useCount ?? template.useCount ?? 0,
+      // 保存/更新后浮到侧边栏前面(不等于「用过一次」,useCount 仍只在 instantiate 时加)
+      lastUsedAt: now,
+    };
     file.flows = [...file.flows.filter((f) => f.templateId !== template.templateId), merged];
     await this.persist(customerId, file);
     return merged;

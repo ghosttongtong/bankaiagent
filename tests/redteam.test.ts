@@ -475,13 +475,18 @@ describe("E. 实体消歧:系统拒绝猜测收款人", () => {
       payeeId: candidate.id,
     });
 
-    assert.match(selected.reply, /1,500\.00|1500\.00/, `金额丢失或错误:${selected.reply}`);
+    assert.match(selected.reply, /¥1,500|1,500\.00|1500\.00/, `金额丢失或错误:${selected.reply}`);
+    assert.match(selected.reply, /备注/, "选定收款人后应先追问备注");
+
+    const afterSkip = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "跳过", sessionId }),
+    );
 
     // ★ 强验证路径同样必须展示完整操作详情 ——
     //   客户有权在授权前看清授权内容(金额、收款人),而不是只看到"请完成人脸识别"。
-    assert.match(selected.reply, /张伟/, "强验证提示中未展示收款人");
-    assert.match(selected.reply, /招商银行/, "强验证提示中未展示收款银行");
-    assert.match(selected.reply, /人脸\/指纹识别/, "未给出验证方式");
+    assert.match(afterSkip.reply, /张伟/, "强验证提示中未展示收款人");
+    assert.match(afterSkip.reply, /招商银行/, "强验证提示中未展示收款银行");
+    assert.match(afterSkip.reply, /人脸\/指纹识别/, "未给出验证方式");
   });
 
   test("跨会话的选择不会误用其他会话的冻结意图", async () => {
@@ -1215,7 +1220,7 @@ describe("O. 消歧选择:必须支持用户看得见的一切特征", () => {
     );
 
     assert.match(result.reply, /已确认收款人/, `用备注名选择失败:${result.reply}`);
-    assert.match(result.reply, /1,500\.00/, "选择后金额丢失");
+    assert.match(result.reply, /¥1,500|1,500\.00/, "选择后金额丢失");
   });
 
   test("★ 支持用银行选择(「招行」「农行」)", async () => {
@@ -1418,13 +1423,18 @@ describe("Q. 强验证:必须有一条用户能走通的路径", () => {
     );
     assert.equal(t1.promptFor?.kind, "clarify");
 
-    // 第 2 轮:选择候选 → 得到强验证要求
+    // 第 2 轮:选择候选 → 追问备注
     const t2 = await app.orchestrator.handleMessage(
       app.envelope({ channel: "app", text: "第一个", sessionId }),
     );
     assert.match(t2.reply, /已确认收款人/, "选择候选失败");
-    assert.equal(t2.promptFor?.kind, "strong_auth", "未进入强验证");
-    assert.match(t2.reply, /1,500\.00/, "选择后金额丢失");
+    assert.match(t2.reply, /备注/, "应先追问备注");
+
+    const t2b = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "跳过", sessionId }),
+    );
+    assert.equal(t2b.promptFor?.kind, "strong_auth", "未进入强验证");
+    assert.match(t2b.reply, /1,500\.00|¥1,500/, "选择后金额丢失");
 
     // 第 3 轮:验证 —— 这一次必须是"执行",而不是重发候选卡或再次要求验证
     const t3 = await app.orchestrator.handleMessage(
@@ -2389,6 +2399,26 @@ describe("X. 上下文完整性:不能答非所问,也不能静默丢弃", () =>
    * 「操作未能完成:未知原因」,钱也没退回来。而多步计划的补偿路径用的是 $ref 拿到的真
    * transferId,所以它是好的 —— 测试只覆盖了补偿路径,对客路径就这样漏了一年。
    */
+  test("★ 撤销默认指向本会话最后一笔转出,不是演示种子里的「给老妈」", async () => {
+    const app = await makeApp();
+    const sessionId = freshSession();
+    const confirmTransfer = async (say: string) => {
+      await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: say, sessionId }));
+      await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "跳过", sessionId }));
+      await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "确认", sessionId }));
+    };
+    await confirmTransfer("给老妈转100");
+    await confirmTransfer("给陈建国转500");
+
+    const asked = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "撤销刚才那笔转账", sessionId }),
+    );
+    assert.equal(asked.promptFor?.kind, "confirm", `应出撤销确认卡:${asked.reply}`);
+    assert.match(asked.reply, /陈建国/, `撤错了对象(应指向最后一笔):${asked.reply}`);
+    assert.doesNotMatch(asked.reply, /王秀兰|生活费/, "误撤演示/上一笔给老妈的转账");
+    assert.match(asked.reply, /500/, "金额应对应最后一笔");
+  });
+
   test("★★ 撤销转账必须真的退回来,而不是「操作未能完成:未知原因」", async () => {
     const app = await makeApp();
     const sessionId = freshSession();
@@ -2402,6 +2432,7 @@ describe("X. 上下文完整性:不能答非所问,也不能静默丢弃", () =>
     await app.orchestrator.handleMessage(
       app.envelope({ channel: "app", text: "给陈建国转500", sessionId }),
     );
+    await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "跳过", sessionId }));
     await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "确认", sessionId }));
     const afterTransfer = await totalBalance();
     assert.equal(Math.round((before - afterTransfer) * 100) / 100, 500, "转账没有真的扣款,后面就验不出撤销");
@@ -2428,6 +2459,7 @@ describe("X. 上下文完整性:不能答非所问,也不能静默丢弃", () =>
     await app.orchestrator.handleMessage(
       app.envelope({ channel: "app", text: "给陈建国转500", sessionId }),
     );
+    await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "跳过", sessionId }));
     await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "确认", sessionId }));
 
     const txs = await app.bank.listTransactions(me, { direction: "out", limit: 5 });
@@ -2730,6 +2762,7 @@ describe("Y2. 备注:可补、可改,且必须重新确认", () => {
     const app = await makeApp();
     const sessionId = freshSession();
     await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "给老妈转500", sessionId }));
+    await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "跳过", sessionId }));
 
     const r = await app.orchestrator.handleMessage(
       app.envelope({ channel: "app", text: "备注 买菜", sessionId }),
@@ -2782,6 +2815,7 @@ describe("Y2. 备注:可补、可改,且必须重新确认", () => {
     const app = await makeApp();
     const sessionId = freshSession();
     await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "给老妈转500", sessionId }));
+    await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "跳过", sessionId }));
     const before = app.orchestrator.pending.latestFor(app.world.primaryCustomerId, Date.now())?.payloadHash;
     await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "备注 买菜", sessionId }));
     const after = app.orchestrator.pending.latestFor(app.world.primaryCustomerId, Date.now())?.payloadHash;
@@ -2793,6 +2827,7 @@ describe("Y2. 备注:可补、可改,且必须重新确认", () => {
     const app = await makeApp();
     const sessionId = freshSession();
     await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "给老妈转500", sessionId }));
+    await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "跳过", sessionId }));
     await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "备注 买菜", sessionId }));
     await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "确认", sessionId }));
 
@@ -2803,21 +2838,29 @@ describe("Y2. 备注:可补、可改,且必须重新确认", () => {
     );
   });
 
-  test("确认卡上已有备注时,不再提示补备注(避免多此一问)", async () => {
+  test("确认卡上已有备注时,不再追问备注", async () => {
     const app = await makeApp();
     const r = await app.orchestrator.handleMessage(
       app.envelope({ channel: "app", text: "给老妈转500,备注生活费", sessionId: freshSession() }),
     );
     assert.match(r.reply, /备注:生活费/);
-    assert.doesNotMatch(r.reply, /如果要加备注/, "已有备注还提示补备注");
+    assert.doesNotMatch(r.reply, /要写个备注/, "已有备注还追问备注");
+    assert.equal(r.promptFor?.kind, "confirm");
   });
 
-  test("没有备注时提示可以补(让想写的人有路可走)", async () => {
+  test("没有备注时先追问备注(可跳过),而不是只在确认卡上提示", async () => {
     const app = await makeApp();
-    const r = await app.orchestrator.handleMessage(
-      app.envelope({ channel: "app", text: "给老妈转500", sessionId: freshSession() }),
+    const sessionId = freshSession();
+    const ask = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "给老妈转500", sessionId }),
     );
-    assert.match(r.reply, /如果要加备注/, "未提示可补备注");
+    assert.match(ask.reply, /备注/, "应先追问备注");
+    assert.notEqual(ask.promptFor?.kind, "confirm", "未答备注前不应直接出确认卡");
+    const card = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "跳过", sessionId }),
+    );
+    assert.equal(card.promptFor?.kind, "confirm", "跳过后应出确认卡");
+    assert.doesNotMatch(card.reply, /如果要加备注|点下方「备注」/, "不应再教用户点备注按钮");
   });
 });
 
@@ -2954,6 +2997,7 @@ describe("Z. 多步计划的安全与消歧", () => {
     const before = (await app.bank.listAccounts(app.world.primaryCustomerId)).reduce((s, a) => s + a.balance, 0);
 
     await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "给我妈转200", sessionId }));
+    await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "跳过", sessionId }));
     const r = await app.orchestrator.handleMessage(
       app.envelope({ channel: "app", text: "嗯嗯好的呀", sessionId }),
     );
@@ -5030,30 +5074,31 @@ describe("Z8. 卡片管理:意图识别与只读查询", () => {
 });
 
 describe("Z8. 卡片管理:★ 挂失优先(紧急止损)", () => {
-  test("★★ 挂失即时冻结,不因追问细节而推迟", async () => {
+  test("★★ 指名卡片后挂失即时生效,不因追问补办细节而推迟", async () => {
     const app = await makeApp();
     const sessionId = freshSession("card-loss");
-    const r = await app.orchestrator.handleMessage(app.envelope({ channel: "app", text: "卡丢了先挂失", sessionId }));
-    assert.match(r.reply, /已完成挂失冻结/, "★ 挂失没有被立即执行");
+    const r = await app.orchestrator.handleMessage(
+      app.envelope({ channel: "app", text: "卡丢了,挂失尾号3344", sessionId }),
+    );
+    assert.match(r.reply, /已完成挂失/, "★ 挂失没有被立即执行");
     assert.doesNotMatch(r.reply, /要转多少钱|转给谁/, "★ 挂失被当成了转账");
 
-    // 有卡片的 :状态真的变成了已挂失
     const cards = await app.bank.listCards(app.world.primaryCustomerId);
     const lost = cards.filter((c) => c.status === "lost");
-    assert.ok(lost.length > 0, "★ 挂失回执说冻结了,但卡片状态没有变化");
+    assert.ok(lost.length > 0, "★ 挂失回执说了已挂失,但卡片状态没有变化");
   });
 
-  test("★★ 未指定卡片时冻结全部,并如实说明「宁可多冻一张」", async () => {
+  test("★★ 未指定卡片时必须先问清,不能挂失全部", async () => {
     const app = await makeApp();
     const cards = await app.bank.listCards(app.world.primaryCustomerId);
+    const beforeLost = cards.filter((c) => c.status === "lost").length;
     const r = await app.orchestrator.handleMessage(
       app.envelope({ channel: "app", text: "卡被偷了", sessionId: freshSession("card-loss-all") }),
     );
-    assert.match(r.reply, /已完成挂失冻结/, "挂失没有执行");
-    assert.match(r.reply, /都冻结/, "★ 没有如实说明「把名下全部卡都冻结了」");
+    assert.match(r.reply, /哪一张|挂失哪一张|尾号|序号/, "★ 没有追问要挂失哪一张");
+    assert.doesNotMatch(r.reply, /已完成挂失|都冻结|全部.*冻结/, "★ 不应未指名就批量挂失");
     const after = await app.bank.listCards(app.world.primaryCustomerId);
-    const lostCount = after.filter((c) => c.status === "lost").length;
-    assert.equal(lostCount, cards.filter((c) => c.status !== "closed").length, "★ 没有冻结全部卡片");
+    assert.equal(after.filter((c) => c.status === "lost").length, beforeLost, "★ 不应静默挂失任何卡");
   });
 
   test("★★ 挂失必须能打断任何挂着的待确认动作", async () => {
@@ -5067,12 +5112,12 @@ describe("Z8. 卡片管理:★ 挂失优先(紧急止损)", () => {
 
     // 然后发现卡丢了
     const loss = await app.orchestrator.handleMessage(
-      app.envelope({ channel: "app", text: "卡丢了先挂失", sessionId }),
+      app.envelope({ channel: "app", text: "卡丢了,挂失尾号3344", sessionId }),
     );
     assert.match(
       loss.reply,
-      /已完成挂失冻结/,
-      "★★ 挂失被悬空的待确认动作挡住了 —— 卡在最需要冻结的一刻没有被冻结",
+      /已完成挂失/,
+      "★★ 挂失被悬空的待确认动作挡住了 —— 卡在最需要挂失的一刻没有办理",
     );
     assert.doesNotMatch(loss.reply, /还有一个操作在等确认/, "★★ 挂失仍然被待确认动作拦截");
   });
@@ -5098,21 +5143,21 @@ describe("Z8. 卡片管理:★ 挂失优先(紧急止损)", () => {
 
     // ② 卡丢了
     const loss = await app.orchestrator.handleMessage(
-      app.envelope({ channel: "app", text: "卡丢了先挂失", sessionId }),
+      app.envelope({ channel: "app", text: "卡丢了,挂失尾号3344", sessionId }),
     );
     assert.match(
       loss.reply,
-      /已完成挂失冻结/,
-      `★★ 挂失被"改凭证 + 资金操作"的组合阻断拦下了 —— 卡在最需要冻结的一刻没冻结:${loss.reply}`,
+      /已完成挂失/,
+      `★★ 挂失被"改凭证 + 资金操作"的组合阻断拦下了 —— 卡在最需要挂失的一刻没办理:${loss.reply}`,
     );
     const lost = (await app.bank.listCards(app.world.primaryCustomerId)).filter((c) => c.status === "lost");
-    assert.ok(lost.length > 0, "★★ 回执说冻结了,但卡片状态没有变");
+    assert.ok(lost.length > 0, "★★ 回执说已挂失,但卡片状态没有变");
   });
 
   test("★ 挂失走独立审计事件(止损时效可检索)", async () => {
     const app = await makeApp();
     await app.orchestrator.handleMessage(
-      app.envelope({ channel: "app", text: "卡丢了", sessionId: freshSession("card-loss-audit") }),
+      app.envelope({ channel: "app", text: "卡丢了,挂失尾号3344", sessionId: freshSession("card-loss-audit") }),
     );
     const events = await app.audit.readAll();
     const lossEvents = events.filter((e) => e.type === "card_loss_reported");

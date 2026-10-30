@@ -90,6 +90,27 @@ export function suggestLowBalance(facts: SuggestionFacts): ProactiveSuggestion |
   return null;
 }
 
+/**
+ * 刚办结且可保存的业务:提示存成常用流程(不必等同一会话办两次)。
+ *
+ * ★ 与 `SUG-SAVE-AS-FLOW` 的分工:
+ *   · 本条 —— **第一次**办成转账/AA/理财等白名单能力后就该看见;
+ *   · 重复办理 —— 会话里同一能力 ≥2 次时的补充提醒。
+ *   保存入口在「办理流程」折叠块里,若不在建议里点一句,客户会以为功能没了。
+ */
+export function suggestSaveFlowNow(input: { capability: string; label: string }): ProactiveSuggestion {
+  const name = FLOW_LABEL[input.capability] ?? input.label;
+  return {
+    id: `save_flow_now:${input.capability}`,
+    ruleId: "SUG-SAVE-FLOW-NOW",
+    text: `这笔「${name}」可以存为常用流程 —— 展开下方「办理流程」点「存为常用流程」,或点这里用一句话保存。`,
+    reason: `刚成功办结(${input.capability}),且属于可保存的业务类型;常用流程需客户显式保存,不会自动写入`,
+    say: "把刚才那个存成常用流程",
+    weight: 78,
+    origin: "history",
+  };
+}
+
 /** 重复的同类业务:提示存成常用流程 */
 export function suggestSaveAsFlow(facts: SuggestionFacts): ProactiveSuggestion | null {
   const counts = new Map<string, number>();

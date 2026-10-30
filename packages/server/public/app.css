@@ -433,61 +433,6 @@ body {
   color: var(--text-dim);
 }
 
-/* ---- 裁决明细 ---- */
-.policy {
-  border-radius: var(--radius-card);
-  border: 1px solid var(--line);
-  background: var(--surface);
-  overflow: hidden;
-}
-.policy > summary {
-  cursor: pointer;
-  padding: 9px 13px;
-  font-size: 12.5px;
-  color: var(--text-dim);
-  list-style: none;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.policy > summary::-webkit-details-marker {
-  display: none;
-}
-.policy > summary::before {
-  content: "▸";
-  font-size: 11px;
-  transition: transform 0.15s;
-}
-.policy[open] > summary::before {
-  transform: rotate(90deg);
-}
-.policy-list {
-  padding: 0 13px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.policy-item {
-  font-size: 12.5px;
-  line-height: 1.45;
-  padding-left: 10px;
-  border-left: 2px solid var(--line);
-  color: var(--text-dim);
-}
-.policy-item.deny {
-  border-left-color: var(--danger);
-  color: #8a1f16;
-}
-.policy-item.escalate {
-  border-left-color: var(--warn);
-  color: #7a4b00;
-}
-.policy-item .rid {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11.5px;
-  color: var(--text-faint);
-}
-
 /* ---- 动作按钮(确认 / 取消 / 验证) ---- */
 .actions {
   display: flex;
@@ -958,9 +903,591 @@ body {
   border-color: #f0dcb8;
 }
 
+/* ============================================================================
+   裁决解释:三段色带 + 指针 + 阈值刻度,展开后是因子贡献与命中条款
+   分段宽度与刻度位置全部由服务端 thresholds 推出,样式里没有任何档位数字。
+   ========================================================================== */
+.risk {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow);
+  padding: 11px 13px 12px;
+}
+/* 嵌在待办卡内部时:不再自成一张卡,只留一条分隔线 */
+.ui-card > .risk {
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  box-shadow: none;
+}
+.risk-top {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.risk-name {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.risk-name i {
+  font-size: 14px;
+}
+.risk-value {
+  margin-left: auto;
+  font-size: 20px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.risk-ok .risk-value {
+  color: var(--ok);
+}
+.risk-warn .risk-value {
+  color: var(--warn);
+}
+.risk-danger .risk-value {
+  color: var(--danger);
+}
+.risk-tag {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+}
+.risk-tag.ok {
+  color: var(--ok);
+  background: var(--ok-soft);
+}
+.risk-tag.warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+.risk-tag.danger {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.risk-bar {
+  position: relative;
+  display: flex;
+  height: 8px;
+  margin-top: 13px;
+}
+.risk-seg {
+  height: 100%;
+}
+.risk-seg.ok {
+  background: #bfe6d1;
+  border-radius: 999px 0 0 999px;
+}
+.risk-seg.warn {
+  background: #f0dcb8;
+}
+.risk-seg.danger {
+  background: #f3c3bb;
+  border-radius: 0 999px 999px 0;
+}
+.risk-needle {
+  position: absolute;
+  top: -4px;
+  width: 3px;
+  height: 16px;
+  border-radius: 2px;
+  background: var(--text);
+  transform: translateX(-50%);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+.risk-scale {
+  position: relative;
+  height: 14px;
+  margin-top: 5px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+.risk-scale span {
+  position: absolute;
+  transform: translateX(-50%);
+  font-variant-numeric: tabular-nums;
+}
+/* 两端的刻度不能被挤出容器 */
+.risk-scale span:first-child {
+  transform: none;
+}
+.risk-scale span:last-child {
+  transform: translateX(-100%);
+}
+.risk-verdict {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.risk-factors {
+  margin-top: 8px;
+}
+.risk-factors summary {
+  font-size: 12px;
+  color: var(--brand);
+  cursor: pointer;
+}
+.risk-factor-list {
+  margin-top: 7px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.risk-factor {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  font-size: 11.5px;
+}
+.risk-factor-name {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-dim);
+}
+.risk-factor-c {
+  flex: 0 0 auto;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+/* 推高分数的贡献标红,拉低分数的(如"白名单且历史≥3笔")标绿 */
+.risk-factor-c.up {
+  color: var(--danger);
+}
+.risk-factor-c.down {
+  color: var(--ok);
+}
+/* 命中的规则条款:与因子同处一个展开区,红=拒绝、黄=需要介入 */
+.risk-rules-head {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.risk-rules {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.risk-rule {
+  font-size: 12px;
+  line-height: 1.45;
+  padding-left: 10px;
+  border-left: 2px solid var(--line);
+  color: var(--text-dim);
+}
+.risk-rule.deny {
+  border-left-color: var(--danger);
+  color: #8a1f16;
+}
+.risk-rule.escalate {
+  border-left-color: var(--warn);
+  color: #7a4b00;
+}
+.risk-rule .rid {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.risk-note {
+  margin-top: 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-faint);
+}
+
+/* ============================================================================
+   通用清单卡:标题 + 结论 + 条目(标题/徽章/右侧数值/补充行)
+   ========================================================================== */
+.lr {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  padding: 11px 13px 12px;
+}
+.lr-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 700;
+}
+.lr-head i {
+  color: var(--brand);
+  font-size: 15px;
+}
+.lr-sub {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+.lr-summary {
+  margin-top: 7px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+.lr-bars {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+.lr-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.lr-item {
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: var(--bg);
+}
+.lr-item.high {
+  border-left-color: var(--danger);
+  background: var(--danger-soft);
+}
+.lr-item.medium {
+  border-left-color: var(--warn);
+  background: var(--warn-soft);
+}
+.lr-item.ok {
+  border-left-color: var(--ok);
+}
+.lr-item-top {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+.lr-title {
+  font-size: 13px;
+  font-weight: 600;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.lr-value {
+  flex: 0 0 auto;
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.lr-badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--line);
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.lr-badge.high {
+  background: var(--danger);
+  color: #fff;
+}
+.lr-badge.medium {
+  background: var(--warn);
+  color: #fff;
+}
+.lr-badge.ok {
+  background: var(--ok);
+  color: #fff;
+}
+.lr-line {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+.lr-footer {
+  margin-top: 10px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-faint);
+}
+
+.quiz-step {
+  border: 1px solid var(--brand-line);
+  border-radius: var(--radius-card);
+  background: var(--brand-soft);
+  padding: 11px 13px 12px;
+}
+.quiz-step .v-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.quiz-progress {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--brand);
+  background: var(--surface);
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.quiz-question {
+  margin-top: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.55;
+  color: var(--text);
+}
+.quiz-options {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.quiz-opt {
+  width: 100%;
+  text-align: left;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text);
+  cursor: pointer;
+}
+.quiz-opt:active {
+  transform: scale(0.995);
+  border-color: var(--brand-line);
+}
+
+/* ============================================================================
+   异常交易清单:高=红、中=琥珀、低=灰,依据与建议分行,不再是一整段纯文字
+   ========================================================================== */
+.anom {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  padding: 11px 13px 12px;
+}
+.anom-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 700;
+}
+.anom-head i {
+  color: var(--brand);
+  font-size: 15px;
+}
+.anom-meta {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+.anom-summary {
+  margin-top: 7px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+.anom-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.anom-item {
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--bg);
+}
+.anom-item.high {
+  border-left-color: var(--danger);
+  background: var(--danger-soft);
+}
+.anom-item.medium {
+  border-left-color: var(--warn);
+  background: var(--warn-soft);
+}
+.anom-item.low {
+  border-left-color: var(--text-faint);
+}
+.anom-item-top {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.anom-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.anom-badge.high {
+  background: var(--danger);
+  color: #fff;
+}
+.anom-badge.medium {
+  background: var(--warn);
+  color: #fff;
+}
+.anom-badge.low {
+  background: var(--line);
+  color: var(--text-dim);
+}
+.anom-title {
+  font-size: 13px;
+  font-weight: 600;
+  flex: 1 1 auto;
+}
+.anom-date {
+  font-size: 11px;
+  color: var(--text-faint);
+  flex: 0 0 auto;
+}
+.anom-desc {
+  margin-top: 5px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+.anom-advice {
+  margin-top: 6px;
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.anom-advice i {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--warn);
+}
+
+/* ============================================================================
+   反诈警示卡:红系 + 图标,与普通的黄色提示拉开档次
+   ========================================================================== */
+.fraud {
+  border: 1px solid #efc0b8;
+  border-left: 3px solid var(--danger);
+  border-radius: var(--radius-card);
+  background: var(--danger-soft);
+  padding: 11px 13px 12px;
+}
+.fraud-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--danger);
+}
+.fraud-head i {
+  font-size: 15px;
+}
+.fraud-headline {
+  margin-top: 7px;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.5;
+  color: #8a1f16;
+}
+/* 反话术提示:客户照着对方剧本走时,最能点醒他的那一句,单独给个底 */
+.fraud-break {
+  margin-top: 8px;
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  background: rgba(255, 255, 255, 0.72);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: #8a1f16;
+}
+.fraud-break i {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--danger);
+}
+.fraud-cap {
+  margin-top: 9px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.fraud-questions {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.fraud-cool,
+.fraud-foot {
+  margin-top: 9px;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+.fraud-cool i,
+.fraud-foot i {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--danger);
+}
+
+/* 长回复折叠:只收高度,内容一字不减 */
+.bubble.is-collapsed {
+  max-height: 190px;
+  overflow: hidden;
+}
+.bubble.is-collapsible {
+  position: relative;
+}
+.bubble.is-collapsed::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 54px;
+  background: linear-gradient(rgba(255, 255, 255, 0), var(--surface));
+  pointer-events: none;
+}
+.bubble-more {
+  display: inline-block;
+  margin-top: 5px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--brand);
+  font-size: 12px;
+  cursor: pointer;
+}
+
 .flow-steps {
   padding: 12px 13px 2px;
 }
+
 .flow-step {
   display: flex;
   gap: 10px;
@@ -1198,6 +1725,36 @@ body {
   line-height: 1.5;
 }
 
+/* 次要块默认折叠:出处/建议/风控/清单余量等与 cite、flow-card 同一套交互 */
+.stack-fold {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.stack-fold > summary {
+  padding: 9px 13px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  cursor: pointer;
+  list-style: none;
+}
+.stack-fold > summary::-webkit-details-marker {
+  display: none;
+}
+.stack-fold .lr-list-more,
+.stack-fold .lr-footer,
+.stack-fold .chart-notes,
+.stack-fold .suggest,
+.stack-fold .risk {
+  padding: 0 13px 12px;
+}
+.stack-fold .lr-list-more {
+  padding-top: 4px;
+}
+
 /* ---- 主动建议 ---- */
 .suggest {
   display: flex;
@@ -1242,6 +1799,38 @@ body {
   color: var(--text-faint);
   line-height: 1.5;
   padding: 0 2px 4px;
+}
+.suggest-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.suggest-plan {
+  background: var(--brand-soft);
+  border: 1px solid var(--brand-line);
+  border-radius: var(--radius-card);
+  padding: 10px 10px 8px;
+  box-shadow: var(--shadow);
+}
+.suggest-plan .suggest-title {
+  color: var(--brand);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.suggest-btn-plan {
+  background: #fff;
+  border-color: var(--brand);
+}
+.lr-event-plan {
+  box-shadow: var(--shadow), inset 0 3px 0 var(--brand);
+  margin-top: 4px;
+}
+.lr-actions-head {
+  font-size: 11.5px;
+  color: var(--brand);
+  font-weight: 600;
+  margin: 10px 0 4px;
+  padding-left: 2px;
 }
 
 /* ---- 首页:我的常用流程 ---- */
@@ -1776,6 +2365,207 @@ body {
   background: var(--brand-soft);
 }
 
+/* ============================================================================
+   区块浏览器:每条审计事件是一块,可展开核对哈希与载荷
+   ========================================================================== */
+.blk {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.blk.hl {
+  border-color: var(--brand-line);
+  background: var(--brand-soft);
+}
+/* 校验定位到断点的那一块:红边 + 淡红底,让人一眼看到链断在哪 */
+.blk.broken {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+.blk-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 12.5px;
+}
+.blk-head::-webkit-details-marker {
+  display: none;
+}
+.blk-seq {
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.blk-type {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  color: var(--text);
+}
+.blk-time {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.blk-body {
+  padding: 0 12px 12px;
+  border-top: 1px dashed var(--line);
+}
+.blk-hash-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 9px;
+}
+.blk-hash-label {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.blk-hash-val {
+  flex: 1;
+  min-width: 0;
+  font-size: 10.5px;
+  word-break: break-all;
+  color: var(--text-dim);
+  background: var(--fill);
+  border-radius: 6px;
+  padding: 5px 7px;
+}
+.blk-copy {
+  flex: 0 0 auto;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--text-dim);
+  border-radius: 6px;
+  font-size: 11px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.blk-meta {
+  margin-top: 9px;
+  font-size: 11px;
+  color: var(--text-faint);
+  word-break: break-all;
+}
+.blk-trace-btn {
+  margin-top: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--brand-line);
+  background: var(--brand-soft);
+  color: var(--brand);
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+.blk-payload {
+  margin: 10px 0 0;
+  max-height: 260px;
+  overflow: auto;
+  background: var(--fill);
+  border-radius: 8px;
+  padding: 9px 10px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ============================================================================
+   全链路瀑布:同一 traceId 的事件按时间顺序排开
+   ========================================================================== */
+.wf-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 10px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--text-dim);
+  border-radius: 8px;
+  font-size: 12px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.wf {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wf-row {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.wf-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  cursor: pointer;
+  list-style: none;
+}
+.wf-head::-webkit-details-marker {
+  display: none;
+}
+.wf-offset {
+  flex: 0 0 58px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.wf-rail {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+}
+.wf-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--brand);
+}
+.wf-label {
+  flex: 0 0 auto;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+/* 时间轴位置条:这一事件落在本次业务的哪一刻 */
+.wf-bar {
+  position: relative;
+  flex: 1;
+  min-width: 20px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--fill);
+}
+.wf-bar > span {
+  position: absolute;
+  top: -2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--brand);
+  transform: translateX(-50%);
+}
+.wf-body {
+  padding: 0 11px 11px;
+}
+
 /* ---- 输入区 ---- */
 .composer {
   flex: 0 0 auto;
@@ -2033,7 +2823,8 @@ body {
   align-items: center;
   gap: 6px;
   overflow-x: auto;
-  padding: 8px 12px 0;
+  /* 底部也要留白:否则标签直接贴在输入框上沿,像同一行被截断的文字 */
+  padding: 8px 12px 9px;
 }
 .thread-tags[hidden] {
   display: none;

@@ -98,3 +98,38 @@ export function condenseForCustomer(text: string): { text: string; removed: stri
 
   return { text: out.join("\n").trim(), removed };
 }
+
+const LIST_ITEM =
+  /^\d+[\.\、]\s|^[\d]+[\.\、]|^[·•]\s|^\[(高|中|低|提示|建议|说明)\]|^【.+】|^\s{2,}\S|^   /;
+
+/** 富交互里把「编号/缩进清单」收成一句,避免对话区刷长文(完整版仍在能力与 CLI)。 */
+export function compactRichListReply(text: string): string {
+  const raw = String(text ?? "").trim();
+  if (!raw) return raw;
+  const lines = raw.split("\n");
+  if (lines.length <= 5) return raw;
+
+  let listish = 0;
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    if (LIST_ITEM.test(t)) listish += 1;
+  }
+  if (listish < 3 && lines.length < 10) return raw;
+
+  const keep: string[] = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    if (LIST_ITEM.test(t)) continue;
+    keep.push(t);
+    if (keep.length >= 2) break;
+  }
+  if (keep.length === 0) {
+    const first = lines.find((l) => l.trim())?.trim();
+    if (first) keep.push(first);
+  }
+  const n = Math.max(listish, lines.length - keep.length);
+  keep.push(`明细共 ${n} 项,见上方卡片。`);
+  return keep.join("\n");
+}

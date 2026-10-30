@@ -111,25 +111,6 @@ export function buildCustomerDesk(input: {
   const upcoming = input.subscriptions
     .filter((s) => s.status === "active" && s.nextDebitAt != null && s.nextDebitAt > input.now && s.nextDebitAt - input.now <= DEBIT_WINDOW_MS)
     .sort((a, b) => (a.nextDebitAt ?? 0) - (b.nextDebitAt ?? 0));
-  if (upcoming.length > 0) {
-    const soonest = upcoming[0]!;
-    const days = daysUntil(input.now, soonest.nextDebitAt!);
-    const preview = upcoming
-      .slice(0, 3)
-      .map((s) => `${s.merchantName} ${yuan(s.amount)}`)
-      .join("、");
-    const countLabel = `共 ${upcoming.length} 笔`;
-    actions.push({
-      id: "debit:upcoming",
-      lane: "action",
-      kind: "debit",
-      title: days <= 0 ? `今天将扣款 · 30 天内${countLabel}` : `最近一笔 ${days} 天后扣款 · 30 天内${countLabel}`,
-      detail: `${preview}${upcoming.length > 3 ? "等" : ""}。这是本行代扣协议上的下次扣款日,取消仍须您确认;商户侧续费不在此列。`,
-      say: "订阅续费提醒",
-      reason: "来自银行核心的代扣协议,不是模型推测",
-      expiresAt: soonest.nextDebitAt,
-    });
-  }
 
   const byCode = new Map(input.products.map((p) => [p.productCode, p]));
   const maturing: Array<{ holding: WealthHolding; at: number; fromBank: boolean }> = [];
@@ -190,15 +171,37 @@ export function buildCustomerDesk(input: {
       id: `plan:${input.plan.planId}`,
       lane: "action",
       kind: "plan",
-      title: `方案进行中:${input.plan.eventTitle}`,
-      detail: `${remainingLabel(input.now, input.plan.expiresAt)} · 还有 ${executable} 步未执行。方案本身一步都没办。`,
-      say: "有哪些关键事件",
+      title: `联动方案进行中:${input.plan.eventTitle}`,
+      detail: `${remainingLabel(input.now, input.plan.expiresAt)} · 还有 ${executable} 步待您逐步确认(方案本身未自动办理)。可说「执行资金操作」或「帮我订花」。`,
+      say: "执行资金操作",
       reason: "本会话里生成过、且仍在 30 分钟有效期内的联动方案",
       expiresAt: input.plan.expiresAt,
     });
   }
 
   const notices: DeskItem[] = [];
+  if (upcoming.length > 0) {
+    const soonest = upcoming[0]!;
+    const days = daysUntil(input.now, soonest.nextDebitAt!);
+    const preview = upcoming
+      .slice(0, 3)
+      .map((s) => `${s.merchantName} ${yuan(s.amount)}`)
+      .join("、");
+    const countLabel = `30 天内共 ${upcoming.length} 笔`;
+    notices.push({
+      id: "debit:upcoming",
+      lane: "notice",
+      kind: "debit",
+      title:
+        days <= 0
+          ? `订阅扣费提醒 · 今天将扣款(${countLabel})`
+          : `订阅扣费提醒 · 最近一笔 ${days} 天后(${countLabel})`,
+      detail: `${preview}${upcoming.length > 3 ? "等" : ""}。来自本行代扣协议的下次扣款日;点开只看清单与说明,取消仍须您确认。商户 App 内续费不在此列。`,
+      say: "订阅续费提醒",
+      reason: "来自银行核心的代扣协议,不是模型推测",
+      expiresAt: soonest.nextDebitAt,
+    });
+  }
   const idle = input.idleCash;
   if (idle) {
     notices.push({
@@ -269,8 +272,11 @@ export function buildCustomerDesk(input: {
     });
   }
 
+  const noticeLimit =
+    upcoming.length > 0 || input.idleCash || (input.billHealth && input.billHealth.tag !== "none") ? 3 : MAX_NOTICES;
+
   return {
     actions: actions.slice(0, MAX_ACTIONS),
-    notices: notices.slice(0, input.idleCash || (input.billHealth && input.billHealth.tag !== "none") ? 3 : MAX_NOTICES),
+    notices: notices.slice(0, noticeLimit),
   };
 }

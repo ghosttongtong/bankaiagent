@@ -19,6 +19,7 @@
  *   这比在提示词里写一句"请不要承诺收益"要可靠得多。
  */
 
+import type { QuizStepVisual } from "../agent/turnExtras.ts";
 import type {
   DemandDepositRate,
   MaturityDisposition,
@@ -1648,4 +1649,24 @@ export function holdingDaysLabel(days: number): string {
   if (days < 30) return `${days} 天`;
   if (days < 365) return `${Math.floor(days / 30)} 个月`;
   return `${(days / 365).toFixed(1)} 年`;
+}
+
+/** App 端逐题风评卡:第 stepIndex 题(0 起)。 */
+export function riskAssessmentQuizVisual(stepIndex: number): QuizStepVisual | null {
+  const q = ASSESSMENT_QUESTIONS[stepIndex];
+  if (!q) return null;
+  const n = stepIndex + 1;
+  const total = ASSESSMENT_QUESTIONS.length;
+  return {
+    kind: "quiz_step",
+    title: "风险承受能力测评",
+    progress: `第 ${n} / ${total} 题`,
+    question: q.question,
+    options: q.options.map((o) => ({
+      optionId: o.optionId,
+      label: `${o.optionId.toUpperCase()}. ${o.label}`,
+      say: o.optionId,
+    })),
+    compactBody: `第 ${n}/${total} 题:点选一项即可。`,
+  };
 }

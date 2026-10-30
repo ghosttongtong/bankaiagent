@@ -44,6 +44,7 @@ import {
   fmtDate,
   renderBillHealth,
 } from "./billAnalysis.ts";
+import { buildPaydayBrief } from "./paydayBrief.ts";
 import {
   ASSESSMENT_QUESTIONS,
   ASSESSMENT_MAX_SCORE,
@@ -67,6 +68,7 @@ import {
   maxProductRiskFor,
   normalizeReturnWording,
   renderProductList,
+  riskAssessmentQuizVisual,
   riskLevelOrdinal,
   rolloverFollowUps,
   scoreAssessment,
@@ -116,6 +118,9 @@ import {
   EVENT_MAX_LEAD_DAYS,
   buildEventPlan,
   checkFundDisclosure,
+  eventPlanFollowUpActions,
+  eventPlanStepListBadge,
+  eventPlanStepListTone,
   listEventTriggers,
   parseEventDateHint,
   renderEventPlan,
@@ -298,6 +303,31 @@ export function registerReadCapabilities(registry: CapabilityRegistry): void {
     monetaryFields: ["accounts[].balance", "accounts[].availableBalance"],
     async execute(_input, ctx): Promise<CapabilityOutcome> {
       const accounts = await ctx.bank.listAccounts(ctx.customerId);
+      const money = (n: number) => n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const total = accounts.reduce((sum, a) => sum + a.balance, 0);
+      // 客户问的是「我还有多少钱」,第一句就必须是钱,而不是「你有几张卡」。
+      // ★ 不做「可用余额加总」:含授信账户时可用合计会大于余额合计,
+      //   客户看到的是"可用比总额还多",反而说不通。可用余额按账户各自展示。
+      const headline = `共 ${accounts.length} 个账户,余额合计 ¥${money(total)}。`;
+      const lines = [
+        headline,
+        ...accounts.map(
+          (a) => `· ${accountTypeLabel(a.type)}(${a.maskedNo}):余额 ¥${money(a.balance)},可用 ¥${money(a.availableBalance)}`,
+        ),
+      ];
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "账户余额",
+          subtitle: headline,
+          items: accounts.map((a) => ({
+            title: `${accountTypeLabel(a.type)}(${a.maskedNo})`,
+            value: `¥${money(a.balance)}`,
+            lines: [`可用 ¥${money(a.availableBalance)}`],
+          })),
+          compactBody: headline,
+        };
+      }
       return {
         ok: true,
         data: {
@@ -310,7 +340,7 @@ export function registerReadCapabilities(registry: CapabilityRegistry): void {
             currency: a.currency,
           })),
         },
-        summary: `共 ${accounts.length} 个账户`,
+        summary: lines.join("\n"),
       };
     },
   });
@@ -361,6 +391,24 @@ export function registerReadCapabilities(registry: CapabilityRegistry): void {
         direction: input["direction"] as "in" | "out" | undefined,
         limit: (input["limit"] as number | undefined) ?? 50,
       });
+
+      if (ctx.extras && txs.length > 0) {
+        const money = (n: number) => n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const shown = txs.slice(0, 20);
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "交易流水",
+          subtitle: `共 ${txs.length} 笔${txs.length > shown.length ? ",下列为最近 20 笔" : ""}`,
+          items: shown.map((t) => ({
+            title: t.counterpartyName,
+            value: `${t.direction === "in" ? "+" : "-"}¥${money(t.amount)}`,
+            badge: t.direction === "in" ? "收入" : "支出",
+            tone: t.direction === "in" ? "ok" : "plain",
+            lines: [`${fmtDate(t.ts)}${t.category ? ` · ${t.category}` : ""}`],
+          })),
+          compactBody: `共查到 ${txs.length} 笔交易,明细见下列清单。`,
+        };
+      }
 
       return {
         ok: true,
@@ -624,6 +672,25 @@ export function registerReadCapabilities(registry: CapabilityRegistry): void {
         ...(input["phone"] ? { phone: String(input["phone"]) } : {}),
         limit: (input["limit"] as number | undefined) ?? 10,
       });
+      const summary = `找到 ${candidates.length} 个可能的收款人`;
+      if (ctx.extras && candidates.length > 0) {
+        const shown = candidates.slice(0, 6);
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "收款人候选",
+          subtitle: summary,
+          items: shown.map((p, i) => ({
+            title: `${i + 1}. ${p.name}`,
+            badge: p.novelty.isFirstTime ? "首次" : p.isWhitelisted ? "常用" : undefined,
+            lines: [
+              `${p.bankName}${p.maskedAccountNo ? ` · ${p.maskedAccountNo}` : ""}`,
+              p.novelty.successCount > 0 ? `曾成功转账 ${p.novelty.successCount} 笔` : "尚无成功记录",
+            ],
+          })),
+          compactBody: `${summary},请点选或回复序号。`,
+          actions: shown.map((_p, i) => ({ label: String(i + 1), say: String(i + 1) })),
+        };
+      }
       return {
         ok: true,
         data: {
@@ -639,7 +706,7 @@ export function registerReadCapabilities(registry: CapabilityRegistry): void {
             aliases: p.aliases,
           })),
         },
-        summary: `找到 ${candidates.length} 个可能的收款人`,
+        summary,
       };
     },
   });
@@ -694,6 +761,27 @@ export function registerReadCapabilities(registry: CapabilityRegistry): void {
         : `注意:户名与账号不完全匹配(实际户名:${result.actualNameMasked ?? "未知"}),建议核实后再转`;
       const feeText =
         fee == null ? "(未给金额,手续费按转账金额另算)" : fee === 0 ? ",手续费:免手续费" : `,手续费:${fee} 元`;
+      const summary = `${matchedText}${feeText}`;
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "收款方可达性",
+          subtitle: cleanName,
+          items: [
+            {
+              title: result.nameMatched ? "户名匹配" : "户名待核实",
+              badge: result.interbank ? "跨行" : "同行",
+              tone: result.nameMatched ? "ok" : "medium",
+              lines: [
+                result.estimatedArrival ?? "",
+                fee != null ? (fee === 0 ? "手续费:免" : `手续费:${fee} 元`) : "给出金额后可试算手续费",
+                result.bankName ?? "",
+              ].filter(Boolean),
+            },
+          ],
+          compactBody: summary,
+        };
+      }
       return {
         ok: true,
         data: {
@@ -706,7 +794,7 @@ export function registerReadCapabilities(registry: CapabilityRegistry): void {
           ...(result.estimatedArrival ? { estimatedArrival: result.estimatedArrival } : {}),
           ...(fee != null ? { fee } : {}),
         },
-        summary: `${matchedText}${feeText}`,
+        summary,
       };
     },
   });
@@ -735,6 +823,22 @@ export function registerReadCapabilities(registry: CapabilityRegistry): void {
     monetaryFields: ["schedules[].amount"],
     async execute(_input, ctx): Promise<CapabilityOutcome> {
       const schedules = await ctx.bank.listSchedules(ctx.customerId);
+      if (ctx.extras && schedules.length > 0) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "定时转账任务",
+          subtitle: `共 ${schedules.length} 个`,
+          items: schedules.map((s) => ({
+            title: s.intent.payee.name,
+            value: `¥${s.intent.amount.toLocaleString("zh-CN")}`,
+            badge: frequencyLabel(s.recurrence.frequency),
+            lines: [
+              `状态:${scheduleStatusLabel(s.status)}${s.nextRunAt ? ` · 下次执行 ${fmtDate(s.nextRunAt)}` : ""}`,
+            ],
+          })),
+          compactBody: `共 ${schedules.length} 个定时转账任务,收款人、周期与下次执行时间见下。`,
+        };
+      }
       return {
         ok: true,
         data: {
@@ -815,6 +919,39 @@ export function registerReadCapabilities(registry: CapabilityRegistry): void {
             lines.push("  款项已收齐。");
           }
         }
+      }
+
+      if (ctx.extras && cols.length > 0) {
+        const pendingCount = cols.reduce((n, c) => n + c.shares.filter((s) => s.status === "pending").length, 0);
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "AA 收款",
+          subtitle: `共 ${cols.length} 笔${pendingCount > 0 ? ` · 还有 ${pendingCount} 人未付` : ""}`,
+          items: cols.map((c) => {
+            const paid = c.shares.filter((s) => s.status === "paid");
+            const unpaid = c.shares.filter((s) => s.status === "pending");
+            const collected = Math.round(paid.reduce((s, x) => s + x.amountPaid, 0) * 100) / 100;
+            const outstanding = Math.round(unpaid.reduce((s, x) => s + (x.amountDue - x.amountPaid), 0) * 100) / 100;
+            return {
+              title: c.title,
+              value: `¥${c.totalAmount.toLocaleString("zh-CN")}`,
+              badge: collectionStatusLabel(c.status),
+              tone: unpaid.length > 0 ? ("medium" as const) : ("ok" as const),
+              lines: [
+                `已收 ¥${collected.toLocaleString("zh-CN")}(${paid.length}/${c.shares.length} 人已付)`,
+                ...c.shares.map(
+                  (s) => `${s.participantName} ${shareStatusLabel(s.status)} ¥${s.amountDue.toLocaleString("zh-CN")}`,
+                ),
+                unpaid.length > 0
+                  ? `待收 ${unpaid.length} 人,合计 ¥${outstanding.toLocaleString("zh-CN")}。如需提醒,请回复「催一下」。`
+                  : "款项已收齐。",
+              ],
+            };
+          }),
+          compactBody:
+            `共 ${cols.length} 笔 AA 收款,逐笔与逐人状态见下。` +
+            (pendingCount > 0 ? `还有 ${pendingCount} 人未付,如需提醒,请回复「催一下」。` : ""),
+        };
       }
 
       return {
@@ -909,6 +1046,24 @@ export function registerReadCapabilities(registry: CapabilityRegistry): void {
       });
 
       const names = unpaid.map((s) => s.participantName).join("、");
+      const outstanding = Math.round(unpaid.reduce((s, x) => s + (x.amountDue - x.amountPaid), 0) * 100) / 100;
+      const summary =
+        `已向【${target.title}】中未付款的 ${unpaid.length} 人发送提醒:${names}。\n` +
+        `待收合计 ¥${outstanding} 元。\n` +
+        "他们会在 App 内收到通知;已付清的人没有被重复打扰。";
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "催收已发送",
+          subtitle: target.title,
+          items: unpaid.map((s) => ({
+            title: s.participantName,
+            value: `¥${s.amountDue.toLocaleString("zh-CN")}`,
+            lines: ["已发送 App 内提醒"],
+          })),
+          compactBody: `已向 ${unpaid.length} 人发送提醒,待收合计 ¥${outstanding} 元。`,
+        };
+      }
       return {
         ok: true,
         data: {
@@ -917,10 +1072,7 @@ export function registerReadCapabilities(registry: CapabilityRegistry): void {
           reminded: unpaid.map((s) => ({ participantName: s.participantName, amountDue: s.amountDue })),
           reason: null,
         },
-        summary:
-          `已向【${target.title}】中未付款的 ${unpaid.length} 人发送提醒:${names}。\n` +
-          `待收合计 ¥${Math.round(unpaid.reduce((s, x) => s + (x.amountDue - x.amountPaid), 0) * 100) / 100} 元。\n` +
-          "他们会在 App 内收到通知;已付清的人没有被重复打扰。",
+        summary,
       };
     },
   });
@@ -1206,6 +1358,23 @@ export function registerBillAnalysisCapabilities(registry: CapabilityRegistry): 
         },
       });
 
+      // 结构化清单同时下发:富交互终端按等级画卡片,正文只留结论,不再刷一屏纯文字
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "anomaly_report",
+          windowLabel: report.windowLabel,
+          checkedCount: report.checkedCount,
+          summary: report.summary,
+          items: report.anomalies.map((a) => ({
+            severity: a.severity,
+            title: a.title,
+            description: a.description,
+            advice: a.suggestedAction.replace(/回复「转人工」/g, "联系反诈专员"),
+            dateLabel: fmtDate(a.ts),
+          })),
+        };
+      }
+
       return { ok: true, data: report, summary: lines.join("\n") };
     },
   });
@@ -1291,6 +1460,22 @@ export function registerBillAnalysisCapabilities(registry: CapabilityRegistry): 
           note: "定期支出识别入链(间隔规律性判据与标准差阈值一并留存),便于复核「为什么这笔被判成订阅」。",
         },
       });
+
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "定期支出与订阅",
+          subtitle: `近 6 个月 · 月度折算合计 ${report.monthlyTotal.toLocaleString("zh-CN")} 元`,
+          summary: report.summary,
+          items: report.items.map((r) => ({
+            title: r.counterpartyName,
+            value: `${r.avgAmount.toLocaleString("zh-CN")} 元`,
+            badge: cadenceLabel(r.cadence),
+            lines: [`共 ${r.count} 笔${r.expectedNext ? `,下次预计 ${fmtDate(r.expectedNext)}` : ""}`],
+          })),
+          compactBody: `${report.summary}月度折算合计 ${report.monthlyTotal.toLocaleString("zh-CN")} 元,逐项明细见下。`,
+        };
+      }
 
       return { ok: true, data: report, summary: lines.join("\n") };
     },
@@ -1444,7 +1629,78 @@ export function registerBillAnalysisCapabilities(registry: CapabilityRegistry): 
         },
       });
 
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "账单洞察",
+          subtitle: report.summary,
+          items: report.insights.slice(0, 6).map((i) => ({
+            title: i.title,
+            badge: i.type === "warning" ? "提示" : i.type === "suggestion" ? "建议" : "说明",
+            tone: i.type === "warning" ? "medium" : i.type === "suggestion" ? "ok" : "plain",
+            lines: i.evidence ? [i.text, `依据:${i.evidence}`] : [i.text],
+          })),
+          compactBody: report.summary,
+        };
+      }
+
       return { ok: true, data: report, summary: lines.join("\n") };
+    },
+  });
+
+  // ---- 发薪后分配清单(演示场景:替代跨场景联动) ----
+  registry.register({
+    name: "account.payday_brief",
+    description:
+      "工资到账后的一次只读汇总:近期入账、定时转账与订阅扣款、粗算可自由支配金额。" +
+      "用户说『工资刚到账帮我理一下怎么分配』『发薪后该怎么花钱』时使用。" +
+      "★ 只汇总事实,不锁资金、不订外部服务;底部给出转账/查订阅等**独立**续办话术,每项仍须单独确认。",
+    inputSchema: z.object({}),
+    outputSchema: z.object({
+      summary: z.string(),
+      discretionary: z.number(),
+      fixedTotal: z.number(),
+    }),
+    sideEffect: "none",
+    moneyMovement: false,
+    readOnly: true,
+    baseTier: "auto",
+    sensitiveFields: [],
+    monetaryFields: ["discretionary", "fixedTotal"],
+    async execute(_input, ctx): Promise<CapabilityOutcome> {
+      const brief = await buildPaydayBrief(ctx);
+      const lines = ["发薪分配清单", brief.summary, "", "★ 以下为只读汇总;点底部按钮或按提示发起转账/查订阅,每一步单独确认。"];
+
+      await ctx.audit.append({
+        ts: ctx.now,
+        traceId: ctx.traceId,
+        sessionId: ctx.sessionId,
+        customerId: ctx.customerId,
+        channel: ctx.channel,
+        type: "execution_completed",
+        payload: {
+          capability: "account.payday_brief",
+          discretionary: brief.discretionary,
+          fixedTotal: brief.fixedTotal,
+          hasSalary: brief.salary != null,
+          note: "发薪清单:数字来自流水、代扣协议与定时任务,不是模型估算。",
+        },
+      });
+
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "发薪分配清单",
+          subtitle: "只读汇总 · 不自动扣款",
+          summary: brief.summary,
+          items: brief.items,
+          compactBody: `${brief.summary} 需要办哪一项,点下方按钮或按提示说即可(每项单独确认)。`,
+          footer: "清单不等于转账;付房租、给生活费、关订阅都要各自走确认流程。",
+          actions: brief.actions,
+        };
+      }
+
+      return { ok: true, data: brief, summary: lines.join("\n") };
     },
   });
 
@@ -1506,6 +1762,27 @@ export function registerBillAnalysisCapabilities(registry: CapabilityRegistry): 
         note: "门槛写在标签依据里。没有同群比较,没有把结余换成可投资金额。",
         kind: "data",
       });
+
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "财务健康标签",
+          subtitle: health.tagLabel,
+          items: [
+            {
+              title: "餐饮月均",
+              value: `¥${health.diningMonthlyAvg.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+              lines: [`窗口:${health.windowLabel}`],
+            },
+            {
+              title: "月均结余",
+              value: `¥${health.surplusMonthlyAvg.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+            },
+          ],
+          compactBody: health.tagLabel,
+          footer: health.reason,
+        };
+      }
 
       return {
         ok: true,
@@ -1633,6 +1910,23 @@ export function registerWealthCapabilities(registry: CapabilityRegistry): void {
           lines.push(...renderProductList(relaxed));
           lines.push("");
           lines.push(buildDisclosureSummary(relaxed));
+          const relaxedHeadline = `在售 ${relaxed.length} 只(已放宽筛选)`;
+          if (ctx.extras) {
+            ctx.extras.visual = {
+              kind: "list_report",
+              title: "理财产品",
+              subtitle: "按原条件未命中,以下为在售列表",
+              summary: relaxedHeadline,
+              items: relaxed.slice(0, 8).map((p, i) => ({
+                title: `${i + 1}. ${p.name}`,
+                value: yieldLabel(p),
+                badge: p.riskLevel,
+                lines: [`起购 ${p.minAmount.toLocaleString("zh-CN")} 元 · ${termLabel(p)} · ${p.productCode}`],
+              })),
+              compactBody: `${relaxedHeadline}。明细见卡片。`,
+              footer: "历史业绩不代表未来表现,不承诺保本保收益。",
+            };
+          }
           return {
             ok: true,
             data: {
@@ -1728,6 +2022,28 @@ export function registerWealthCapabilities(registry: CapabilityRegistry): void {
           note: "风险提示已随列表发出:提示是列表的一部分,不是可选的补充文案。独立成事件便于监管直接检索「提示有没有发」。",
         },
       });
+
+      const listHeadline = `在售 ${products.length} 只`;
+      const riskNote =
+        profile.assessed && profile.level
+          ? `您的等级 ${profile.level},可购 ${profile.maxProductRiskLevel} 及以下`
+          : "未完成测评 · 购买前须先测评";
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "理财产品",
+          subtitle: riskNote,
+          summary: listHeadline,
+          items: products.slice(0, 8).map((p, i) => ({
+            title: `${i + 1}. ${p.name}`,
+            value: yieldLabel(p),
+            badge: p.riskLevel,
+            lines: [`起购 ${p.minAmount.toLocaleString("zh-CN")} 元 · ${termLabel(p)} · ${p.productCode}`],
+          })),
+          compactBody: `${listHeadline}。明细见卡片;说「买第1个」或产品名可继续。`,
+          footer: "历史业绩不代表未来表现,不承诺保本保收益。",
+        };
+      }
 
       return {
         ok: true,
@@ -1848,6 +2164,31 @@ export function registerWealthCapabilities(registry: CapabilityRegistry): void {
       lines.push(`适配性:${suit.message}`);
       lines.push("");
       lines.push(product.riskDisclosure);
+
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "产品详情",
+          subtitle: `${product.name} · ${yieldLabel(product)}`,
+          summary: suit.message,
+          items: [
+            {
+              title: product.name,
+              value: yieldLabel(product),
+              badge: product.riskLevel,
+              lines: [
+                `起购 ${product.minAmount.toLocaleString("zh-CN")} 元 · ${termLabel(product)}`,
+                `净值 ${product.nav.toFixed(4)} · ${settlementLabel(product)}`,
+              ],
+            },
+          ],
+          compactBody: suit.message,
+          footer:
+            product.riskDisclosure.length > 100
+              ? `${product.riskDisclosure.slice(0, 97)}…`
+              : product.riskDisclosure,
+        };
+      }
 
       return {
         ok: true,
@@ -2012,6 +2353,25 @@ export function registerWealthCapabilities(registry: CapabilityRegistry): void {
         },
       });
 
+      const compareLead = autoPicked
+        ? "以下为系统选取的两只产品,不构成推荐。"
+        : `对比 ${result.rows.length} 只,各维度谁更优见卡片。`;
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "产品对比",
+          subtitle: compareLead,
+          items: result.rows.map((r, i) => ({
+            title: `${i + 1}. ${r.name}`,
+            value: r.yieldText,
+            badge: r.riskLevel,
+            lines: [`${r.termText} · 起购 ${r.minAmountText} · ${r.settlementText}`],
+          })),
+          compactBody: compareLead,
+          footer: "我不替您下「哪个更好」的结论;取舍取决于您的风险承受能力。",
+        };
+      }
+
       return {
         ok: true,
         data: {
@@ -2111,15 +2471,11 @@ export function registerWealthCapabilities(registry: CapabilityRegistry): void {
           );
           lines.push("");
         }
-        lines.push("风险承受能力测评(共 6 题)");
-        lines.push("请按顺序回复选项字母,可一次答完,例如「a b c d e c」。");
-        lines.push("");
-        for (const [i, q] of ASSESSMENT_QUESTIONS.entries()) {
-          lines.push(`${i + 1}. ${q.question}`);
-          for (const o of q.options) lines.push(`   ${o.optionId}. ${o.label}`);
-          lines.push("");
+        lines.push("风险测评共 6 题。在 App 里我会一题一题请您作答;说「做风险测评」或「开始」即可。");
+        if (ctx.extras) {
+          const step = riskAssessmentQuizVisual(0);
+          if (step) ctx.extras.visual = step;
         }
-        lines.push("测评结果仅用于判断产品适配,不影响浏览。请如实作答;评级偏高可能导致购买超出承受能力的产品。");
 
         return {
           ok: true,
@@ -2216,6 +2572,24 @@ export function registerWealthCapabilities(registry: CapabilityRegistry): void {
       lines.push("");
       lines.push("本次评级及作答记录已写入档案,可供日后复核。");
       lines.push("评级用于确定可购买的产品风险上限。");
+
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "测评结果",
+          subtitle: `${profile.level} ${profile.levelLabel}`,
+          summary: `可购 ${profile.maxProductRiskLevel} 及以下 · 有效至 ${new Date(validUntil).toLocaleDateString("zh-CN")}`,
+          items: [
+            {
+              title: "问卷得分",
+              value: `${scoring.score}/${ASSESSMENT_MAX_SCORE}`,
+              lines: [scoring.description],
+            },
+          ],
+          compactBody: `测评完成:您的风险等级为 ${profile.level}(${profile.levelLabel}),可购 ${profile.maxProductRiskLevel} 及以下。`,
+          ...(scoring.consistencyNote ? { footer: scoring.consistencyNote } : {}),
+        };
+      }
 
       // ★ 独立审计事件:监管来查的时候问的就是"这个客户为什么被评为 C4",
       //   需要的不是等级本身,而是**他当时到底答了什么**。只存结果是不可复核的。
@@ -2408,6 +2782,33 @@ export function registerWealthCapabilities(registry: CapabilityRegistry): void {
         kind: "data",
       });
       if (ctx.extras) ctx.extras.hasMonetary = true;
+
+      const holdHeadline = `市值 ${fmtMoney(totalMarketValue)} 元 · 累计 ${totalProfit >= 0 ? "+" : ""}${fmtMoney(totalProfit)} 元`;
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "理财持仓",
+          subtitle: holdHeadline,
+          summary: `本金 ${fmtMoney(totalCost)} 元 · 共 ${holdings.length} 只`,
+          bars: holdings.map((h) => ({
+            label: h.productName.length > 10 ? `${h.productName.slice(0, 9)}…` : h.productName,
+            value: h.marketValue,
+            tone: h.profit >= 0 ? "ok" : "medium",
+          })),
+          items: holdings.map((h, i) => ({
+            title: `${i + 1}. ${h.productName}`,
+            value: `¥${fmtMoney(h.marketValue)}`,
+            badge: h.riskLevel,
+            tone: h.profit >= 0 ? "ok" : "medium",
+            lines: [
+              `份额 ${h.shares.toLocaleString("zh-CN")} · 净值 ${h.nav.toFixed(4)}(成本 ${h.avgCostNav.toFixed(4)})`,
+              `累计 ${h.profit >= 0 ? "+" : ""}${fmtMoney(h.profit)}(${fmtPct(h.profitRate)}) · 持有 ${holdingDaysLabel(h.holdingDays)} · ${h.settlement === "T+0" ? "T+0到账" : h.settlement === "T+1" ? "T+1到账" : "T+2到账"}`,
+            ],
+          })),
+          compactBody: `${holdHeadline}。明细与市值构成见卡片;赎回可说「第2个赎回」。`,
+          footer: "浮动收益随净值变化;赎回以当日净值为准。",
+        };
+      }
 
       return {
         ok: true,
@@ -2863,6 +3264,21 @@ export function registerWealthCapabilities(registry: CapabilityRegistry): void {
           note: "续接方案随风险提示一起发出。",
         },
       });
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "到期续接方案",
+          subtitle: `${plan.productName} · 到期市值 ${fmtMoney(plan.marketValue)} 元`,
+          items: plan.candidates.map((c, i) => ({
+            title: `${i + 1}. ${c.name}`,
+            value: c.yieldText,
+            badge: c.riskLevel,
+            lines: [c.drawdownText],
+          })),
+          compactBody: `${plan.productName} 即将到期,候选见卡片;说「续接第1个」或「不续投」。`,
+          footer: plan.demandRateText,
+        };
+      }
       return {
         ok: true,
         data: {
@@ -3255,6 +3671,23 @@ export function registerNoteCapabilities(registry: CapabilityRegistry): void {
         }>;
       };
       const notes = typeof bank.listAnnotations === "function" ? bank.listAnnotations(ctx.customerId, (input["limit"] as number) ?? 20) : [];
+      const noteSummary = `共 ${notes.length} 条记账批注`;
+      if (ctx.extras && notes.length > 0) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "记账批注",
+          subtitle: noteSummary,
+          items: notes.slice(0, 15).map((n) => ({
+            title: n.title,
+            value: n.amount != null ? `¥${n.amount.toLocaleString("zh-CN")}` : undefined,
+            lines: [
+              n.direction ? `方向:${n.direction}` : "",
+              n.tags.length > 0 ? n.tags.join(" · ") : "",
+            ].filter(Boolean),
+          })),
+          compactBody: noteSummary,
+        };
+      }
       return {
         ok: true,
         data: {
@@ -3267,7 +3700,7 @@ export function registerNoteCapabilities(registry: CapabilityRegistry): void {
             createdAt: n.createdAt,
           })),
         },
-        summary: `共 ${notes.length} 条记账批注`,
+        summary: noteSummary,
       };
     },
   });
@@ -3378,6 +3811,28 @@ export function registerTransferCapabilities(registry: CapabilityRegistry): void
       const fee = amount != null ? transferFeeOf(amount, info.interbank) : null;
       const feeText =
         fee == null ? "需给出转账金额才能试算手续费" : fee === 0 ? "免手续费" : `手续费 ${fee} 元`;
+      const summary = `${feeText},${info.estimatedArrival ?? "实时到账"}`;
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "转账试算",
+          subtitle: sanitizePayeeName(String(input["payeeName"])),
+          items: [
+            {
+              title: "预计到账",
+              value: info.estimatedArrival ?? "实时到账",
+              badge: info.interbank ? "跨行" : "同行",
+              tone: info.nameMatched ? "ok" : "medium",
+              lines: [
+                feeText,
+                amount != null ? `金额 ${amount.toLocaleString("zh-CN")} 元` : "未给金额",
+                ...warnings,
+              ],
+            },
+          ],
+          compactBody: summary,
+        };
+      }
 
       return {
         ok: true,
@@ -3388,7 +3843,7 @@ export function registerTransferCapabilities(registry: CapabilityRegistry): void
           interbank: info.interbank,
           warnings,
         },
-        summary: `${feeText},${info.estimatedArrival ?? "实时到账"}`,
+        summary,
       };
     },
   });
@@ -4023,6 +4478,30 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
         },
       });
 
+      if (ctx.extras && cards.length > 0) {
+        const focus = typeof input["focusNote"] === "string" ? String(input["focusNote"]) : "";
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "我的银行卡",
+          subtitle: `共 ${cards.length} 张`,
+          items: cards.map((c) => ({
+            title: `${c.productName}(尾号 ${c.last4})`,
+            badge: c.statusLabel,
+            tone: isCardBlocked(c.status) ? ("high" as const) : ("plain" as const),
+            value: (c.creditLimit ?? 0) > 0 ? `可用 ¥${(c.availableLimit ?? 0).toLocaleString("zh-CN")}` : undefined,
+            lines: [
+              (c.creditLimit ?? 0) > 0
+                ? `${c.kindLabel} · 额度 ¥${(c.creditLimit ?? 0).toLocaleString("zh-CN")}`
+                : `${c.kindLabel} · 借记卡没有授信额度,能花多少取决于账户余额`,
+            ],
+          })),
+          compactBody:
+            `${focus ? `${focus}\n` : ""}您名下共有 ${cards.length} 张卡,状态与额度见下。` +
+            (hasBlocked ? "其中有卡片当前不可用,已在清单中标出。" : "") +
+            "要操作某一张,可以直接说序号或尾号。",
+        };
+      }
+
       return {
         ok: true,
         data: {
@@ -4124,6 +4603,28 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
         lines.push("该卡尚未激活,激活后方可使用。如需办理,请回复「激活这张卡」。");
       }
 
+      const cardSummary = lines.join("\n");
+      if (ctx.extras) {
+        const detailLines = [
+          `状态:${CARD_STATUS_LABELS[card.status]}`,
+          card.creditLimit != null
+            ? `额度 ${fmtCardMoney(card.creditLimit)} · 可用 ${fmtCardMoney(card.availableLimit ?? 0)}`
+            : "借记卡,无授信额度",
+          `有效期至 ${fmtCardDay(card.expiresAt)}`,
+        ];
+        if (card.restriction) {
+          const diag = diagnoseRestriction(card, ctx.now);
+          detailLines.push(diag.summary);
+        }
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "卡片详情",
+          subtitle: `${card.productName} · 尾号 ${card.last4}`,
+          items: [{ title: CARD_KIND_LABELS[card.kind], value: CARD_STATUS_LABELS[card.status], lines: detailLines }],
+          compactBody: `${card.productName}(尾号 ${card.last4}) · ${CARD_STATUS_LABELS[card.status]}`,
+        };
+      }
+
       return {
         ok: true,
         data: {
@@ -4142,9 +4643,9 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
           restrictionCause: card.restriction?.cause ?? null,
           restrictionCauseLabel: card.restriction?.causeLabel ?? null,
           restrictionChannel: card.restriction?.channel ?? null,
-          summary: lines.join("\n"),
+          summary: cardSummary,
         },
-        summary: lines.join("\n"),
+        summary: cardSummary,
       };
     },
   });
@@ -4200,6 +4701,30 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
         lines.push("我会先把申请额度、审核时效,以及「审核通过才生效」这件事说清楚,由您确认后再提交。");
       }
 
+      const eligSummary = lines.join("\n");
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "提额资格",
+          subtitle: `${card.productName} · 尾号 ${card.last4}`,
+          summary: elig.reason,
+          items: [
+            {
+              title: elig.canApply ? "可以申请" : "暂不可申请",
+              value:
+                elig.suggestedMaxLimit != null
+                  ? `可提到 ¥${fmtCardMoney(elig.suggestedMaxLimit)}`
+                  : undefined,
+              tone: elig.canApply ? "ok" : "medium",
+              lines: [elig.ourPart, elig.bankPart],
+            },
+          ],
+          compactBody: elig.canApply
+            ? `${elig.reason} 可申请提到 ${fmtCardMoney(elig.suggestedMaxLimit ?? 0)} 元。`
+            : elig.reason,
+        };
+      }
+
       return {
         ok: true,
         data: {
@@ -4211,23 +4736,23 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
           reason: elig.reason,
           ourPart: elig.ourPart,
           bankPart: elig.bankPart,
-          summary: lines.join("\n"),
+          summary: eligSummary,
         },
-        summary: lines.join("\n"),
+        summary: eligSummary,
       };
     },
   });
 
-  // ---- ★ 挂失冻结(紧急安全动作,自动执行)----
+  // ---- ★ 挂失(紧急安全动作,自动执行)----
   registry.register({
     name: "card.report_loss",
     description:
-      "挂失(立即冻结)卡片,阻止一切交易。用户说『卡丢了』『卡被偷了』『马上挂失』『把卡冻结』时使用。" +
-      "★ 这是紧急止损动作,系统会**先冻结再聊补办细节** —— 不要为了追问细节而推迟冻结。" +
-      "★ 用户没说清是哪一张时,冻结其名下全部卡片(卡片少时这是最安全的做法,会在回执里说明)。",
+      "挂失卡片,阻止该卡一切交易。用户说『卡丢了』『卡被偷了』『马上挂失』时使用。" +
+      "★ 这是紧急止损动作,系统会**先挂失再聊补办细节** —— 不要为了追问细节而推迟办理。" +
+      "★ 必须明确是哪一张卡;未指定时由路由层先问清,不能默认挂失全部卡片。",
     inputSchema: z.object({
-      cardId: z.string().optional().describe("卡片 ID;不填表示冻结用户名下全部卡片"),
-      cardIds: z.array(z.string()).optional().describe("要冻结的卡片 ID 列表"),
+      cardId: z.string().optional().describe("要挂失的卡片 ID"),
+      cardIds: z.array(z.string()).optional().describe("要挂失的卡片 ID 列表(批量,极少使用)"),
       scenario: z.string().max(200).optional().describe("用户自述的丢失/被盗情形"),
       reason: z.string().max(100).optional().describe("挂失原因代码"),
     }),
@@ -4247,7 +4772,7 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
       summary: z.string(),
     }),
     /**
-     * ★★ moneyMovement 必须是 `false`:挂失**不动一分钱**,它只是把卡冻结。
+     * ★★ moneyMovement 必须是 `false`:挂失**不动一分钱**,只是停用该卡。
      *
      *   这个字段被写错不是文字问题,是**真实的拦截**:策略里有
      *   R-CREDENTIAL-MONEY-COMBO(同一会话内"改凭证 + 资金操作"阻断),
@@ -4276,9 +4801,18 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
           ? [String(input["cardId"])]
           : null;
 
-      const targets = explicit
-        ? all.filter((c) => explicit.includes(c.cardId))
-        : all.filter((c) => c.status !== "closed");
+      if (!explicit || explicit.length === 0) {
+        return {
+          ok: false,
+          error: {
+            code: "CARD_NOT_SPECIFIED",
+            message: "请说明要挂失哪一张卡(可以说尾号或序号,或先看「我有哪些卡」)。",
+            retryable: true,
+          },
+        };
+      }
+
+      const targets = all.filter((c) => explicit.includes(c.cardId));
 
       if (targets.length === 0) {
         return {
@@ -4313,25 +4847,18 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
           capability: "card.report_loss",
           frozenCardCount: frozen.length,
           cards: frozen.map((f) => `${f.productName} 尾号 ${f.last4}`),
-          /** 是否用户点名了具体卡片;未点名时按"全部冻结"处理,这是刻意的保守选择 */
-          userSpecifiedCard: explicit != null,
+          userSpecifiedCard: true,
           scenario: input["scenario"] ?? null,
           immediate: true,
-          note:
-            "挂失冻结是紧急止损动作:按「先冻结、后补办」的顺序处理,不因追问细节而延迟冻结。" +
-            "未指定卡片时冻结名下全部卡 —— 宁可多冻一张,不可漏冻一张。",
+          note: "挂失是紧急止损动作:按「先挂失、后补办」的顺序处理,不因追问补办细节而延迟办理。",
         },
       });
 
       const lines: string[] = [];
-      lines.push(`已完成挂失冻结(${frozen.length} 张卡,即时生效):`);
+      lines.push(`已完成挂失(${frozen.length} 张,即时生效):`);
       for (const f of frozen) lines.push(`  · ${f.productName} 尾号 ${f.last4}`);
       lines.push("");
       lines.push("上述卡片现已无法交易,包括刷卡、取现、线上支付与自动扣款。");
-      if (explicit == null && targets.length > 1) {
-        lines.push("");
-        lines.push(`未指定具体卡片,已将名下 ${targets.length} 张卡都冻结,以免遗漏。如仅遗失其中一张,可回复「解除尾号 XXXX 的挂失」(需身份验证)。`);
-      }
 
       const nextSteps = [
         "补办新卡:换号补卡约 5 个工作日,保留原号约 12 个工作日(需您选择)",
@@ -4342,6 +4869,22 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
       lines.push("后续可办理:");
       for (const s of nextSteps) lines.push(`  · ${s}`);
 
+      const lossSummary = lines.join("\n");
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "挂失回执",
+          subtitle: `已挂失 ${frozen.length} 张 · 即时生效`,
+          items: frozen.map((f) => ({
+            title: `${f.productName} · 尾号 ${f.last4}`,
+            badge: "已挂失",
+            tone: "medium" as const,
+          })),
+          compactBody: `已完成挂失 ${frozen.length} 张,该卡现已无法交易。`,
+          footer: "补卡、解挂需另行办理;自动扣款将失败直至重新绑定。",
+        };
+      }
+
       return {
         ok: true,
         data: {
@@ -4350,9 +4893,9 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
           immediate: true,
           reference: `LOSS-${Date.now().toString(36).toUpperCase()}`,
           nextSteps,
-          summary: lines.join("\n"),
+          summary: lossSummary,
         },
-        summary: lines.join("\n"),
+        summary: lossSummary,
       };
     },
   });
@@ -4436,6 +4979,32 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
         },
       });
 
+      const restrSummary = lines.join("\n");
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "交易限制诊断",
+          subtitle: `${card.productName} · 尾号 ${card.last4}`,
+          summary: diag.summary,
+          items: [
+            {
+              title: card.restriction ? card.restriction.causeLabel : "无限制",
+              badge: card.restriction ? RESTRICTION_CHANNEL_LABELS[card.restriction.channel] : "正常",
+              tone: card.restriction ? "medium" : "ok",
+              lines: [
+                ...(card.restriction?.requiredDocuments.length
+                  ? [`材料:${card.restriction.requiredDocuments.join("、")}`]
+                  : []),
+                card.restriction?.estimatedResolution ?? "",
+                ...diag.nextActions.slice(0, 3),
+              ].filter(Boolean),
+            },
+          ],
+          compactBody: diag.summary,
+          footer: canUnblock ? "如需提交解除申请,请说「申请解除限制」。" : undefined,
+        };
+      }
+
       return {
         ok: true,
         data: {
@@ -4447,9 +5016,9 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
           requiredDocuments: card.restriction?.requiredDocuments ?? [],
           estimatedResolution: card.restriction?.estimatedResolution ?? null,
           canSubmitUnblock: canUnblock,
-          summary: lines.join("\n"),
+          summary: restrSummary,
         },
-        summary: lines.join("\n"),
+        summary: restrSummary,
       };
     },
   });
@@ -5129,6 +5698,27 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
         }
       }
 
+      const limitSummary = lines.join("\n");
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "提额进度",
+          subtitle: `${list.length} 笔申请`,
+          items: list.map((a, i) => ({
+            title: `${i + 1}. 尾号 ${a.cardLast4}`,
+            value: a.statusLabel,
+            badge: a.applicationId.slice(-6),
+            tone: a.status === "approved" ? "ok" : a.status === "rejected" ? "high" : "medium",
+            lines: [
+              `目标 ${fmtCardMoney(a.requestedLimit)} · 当前 ${fmtCardMoney(a.currentLimit)}`,
+              `提交 ${fmtCardDay(a.submittedAt)} · 预计 ${fmtCardDay(a.estimatedDecisionAt)}`,
+              a.decisionNote ?? "",
+            ].filter(Boolean),
+          })),
+          compactBody: `共有 ${list.length} 笔提额申请,状态见卡片。`,
+        };
+      }
+
       return {
         ok: true,
         data: {
@@ -5143,9 +5733,9 @@ export function registerCardCapabilities(registry: CapabilityRegistry): void {
             submittedText: fmtCardDay(a.submittedAt),
             decisionNote: a.decisionNote ?? null,
           })),
-          summary: lines.join("\n"),
+          summary: limitSummary,
         },
-        summary: lines.join("\n"),
+        summary: limitSummary,
       };
     },
   });
@@ -5380,6 +5970,23 @@ export function registerSubscriptionCapabilities(registry: CapabilityRegistry): 
         },
       });
 
+      const scanSummary = lines.join("\n");
+      if (ctx.extras && items.length > 0) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "订阅代扣识别",
+          subtitle: scan.summary,
+          items: items.slice(0, 10).map((item, i) => ({
+            title: `${i + 1}. ${item.merchantName}`,
+            value: `¥${fmtSubMoney(item.amount)}`,
+            badge: item.cancelable ? "可本行取消" : "商户侧",
+            tone: item.cancelable ? "ok" : "medium",
+            lines: [item.cadence, item.nextDebitAt != null ? `下次 ${fmtSubDay(item.nextDebitAt)}` : ""].filter(Boolean),
+          })),
+          compactBody: `识别 ${items.length} 笔订阅,本月仍将扣约 ¥${fmtSubMoney(scan.monthlyTotal)}。明细见卡片。`,
+        };
+      }
+
       return {
         ok: true,
         data: {
@@ -5392,9 +5999,9 @@ export function registerSubscriptionCapabilities(registry: CapabilityRegistry): 
           items: items.map(subscriptionItemData),
           excluded: scan.excluded,
           windowDays,
-          summary: lines.join("\n"),
+          summary: scanSummary,
         },
-        summary: lines.join("\n"),
+        summary: scanSummary,
       };
     },
   });
@@ -5474,6 +6081,26 @@ export function registerSubscriptionCapabilities(registry: CapabilityRegistry): 
         },
       });
 
+      const subListSummary = lines.join("\n");
+      if (ctx.extras && upcoming.length > 0) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "续费提醒",
+          subtitle: `${withinDays} 天内 ${upcoming.length} 笔 · 合计 ¥${fmtSubMoney(upcomingTotal)}`,
+          items: upcoming.map((item, i) => ({
+            title: `${i + 1}. ${item.merchantName}`,
+            value: `¥${fmtSubMoney(item.amount)}`,
+            badge: subDaysText(item.daysUntilNext),
+            tone: item.daysUntilNext != null && item.daysUntilNext <= 7 ? "medium" : "plain",
+            lines: [
+              item.nextDebitAt != null ? fmtSubDay(item.nextDebitAt) : "",
+              item.cancelable ? "可在本行取消" : "仅能在商户侧关闭",
+            ].filter(Boolean),
+          })),
+          compactBody: `未来 ${withinDays} 天有 ${upcoming.length} 笔要扣款,合计 ¥${fmtSubMoney(upcomingTotal)}。`,
+        };
+      }
+
       return {
         ok: true,
         data: {
@@ -5482,9 +6109,9 @@ export function registerSubscriptionCapabilities(registry: CapabilityRegistry): 
           upcomingTotal,
           items: upcoming.map((i) => ({ ...subscriptionItemData(i), absoluteDate: i.nextDebitAt != null ? fmtSubDay(i.nextDebitAt) : null })),
           merchantSideCount: upcoming.filter((i) => !i.cancelable).length,
-          summary: lines.join("\n"),
+          summary: subListSummary,
         },
-        summary: lines.join("\n"),
+        summary: subListSummary,
       };
     },
   });
@@ -5555,6 +6182,7 @@ export function registerSubscriptionCapabilities(registry: CapabilityRegistry): 
       }
 
       const lines = renderSubscriptionDetail(item, ctx.now);
+      const subSummary = lines.join("\n");
       await ctx.audit.append({
         ts: ctx.now,
         traceId: ctx.traceId,
@@ -5571,6 +6199,29 @@ export function registerSubscriptionCapabilities(registry: CapabilityRegistry): 
         },
       });
 
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "订阅代扣详情",
+          subtitle: item.merchantName,
+          items: [
+            {
+              title: item.merchantName,
+              value: `¥${fmtSubMoney(item.amount)}`,
+              badge: item.cancelable ? "可本行取消" : item.cancelChannelLabel,
+              tone: item.cancelable ? "ok" : "medium",
+              lines: [
+                item.cadenceLabel,
+                item.nextDebitAt != null ? `下次扣款 ${fmtSubDay(item.nextDebitAt)}` : "暂无下次扣款日",
+                item.cancelConsequence,
+              ],
+            },
+          ],
+          compactBody: `${item.merchantName} 每期 ¥${fmtSubMoney(item.amount)} · ${item.cancelable ? "可在本行取消" : "需在商户侧关闭"}`,
+          footer: item.refundPolicy,
+        };
+      }
+
       return {
         ok: true,
         data: {
@@ -5581,9 +6232,9 @@ export function registerSubscriptionCapabilities(registry: CapabilityRegistry): 
           nextDebitAt: item.nextDebitAt,
           cancelable: item.cancelable,
           cancelBlockReason: item.cancelBlockReason,
-          summary: lines.join("\n"),
+          summary: subSummary,
         },
-        summary: lines.join("\n"),
+        summary: subSummary,
       };
     },
   });
@@ -5889,6 +6540,21 @@ function registerBudgetCapabilities(registry: CapabilityRegistry): void {
         });
         if (ctx.extras) ctx.extras.hasMonetary = true;
 
+        if (ctx.extras) {
+          ctx.extras.visual = {
+            kind: "list_report",
+            title: "本月支出",
+            subtitle: `${monthLabel} 已支出 ${moneyText(spent)} 元`,
+            bars: topCategories.slice(0, 5).map((c) => ({ label: c.key, value: c.total, tone: "plain" as const })),
+            items: topCategories.slice(0, 5).map((c) => ({
+              title: c.key,
+              value: `¥${moneyText(c.total)}`,
+              lines: [`${c.count} 笔`],
+            })),
+            compactBody: `${monthLabel} 已支出 ${moneyText(spent)} 元。告诉我预算额(如「预算5000」),我帮您算每天可用多少。`,
+          };
+        }
+
         return {
           ok: true,
           data: {
@@ -5963,6 +6629,26 @@ function registerBudgetCapabilities(registry: CapabilityRegistry): void {
         kind: "data",
       });
       if (ctx.extras) ctx.extras.hasMonetary = true;
+
+      const budgetLead =
+        remaining < 0
+          ? `预算已超 ${moneyText(Math.abs(remaining))} 元`
+          : `还剩 ${moneyText(remaining)} 元 · 日均约 ${moneyText(dailyAllowance)} 元`;
+      if (ctx.extras) {
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "本月预算",
+          subtitle: `${monthLabel} 预算 ${moneyText(budget)} 元 · 已用 ${moneyText(spent)} 元`,
+          summary: budgetLead,
+          bars: topCategories.slice(0, 5).map((c) => ({ label: c.key, value: c.total, tone: "plain" as const })),
+          items: topCategories.slice(0, 5).map((c) => ({
+            title: c.key,
+            value: `¥${moneyText(c.total)}`,
+            lines: [`${c.count} 笔 · 占 ${spent > 0 ? Math.round((c.total / spent) * 1000) / 10 : 0}%`],
+          })),
+          compactBody: `${monthLabel} ${budgetLead}。`,
+        };
+      }
 
       return {
         ok: true,
@@ -6257,10 +6943,36 @@ export function registerEventCapabilities(registry: CapabilityRegistry): void {
       if (focus !== "events") {
         lines.push(renderEventTriggerList());
       }
+      const eventSummary = lines.join("\n");
+      if (ctx.extras && (events.length > 0 || triggers.length > 0)) {
+        const dayFmt = (ts: number) =>
+          new Date(ts).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai", month: "numeric", day: "numeric" });
+        const items = [
+          ...events.slice(0, 8).map((e) => ({
+            title: e.title,
+            badge: e.kindLabel,
+            lines: [`${dayFmt(e.occursAt)} · ${e.sourceLabel}`],
+          })),
+          ...(focus === "events"
+            ? []
+            : triggers.slice(0, 4).map((t) => ({
+                title: t.kindLabel,
+                badge: "触发器",
+                lines: [`提前 ${t.leadDays} 天 · ${t.mounts}`],
+              }))),
+        ];
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "关键事件",
+          subtitle: `已登记 ${events.length} 个 · 触发器 ${triggers.length} 类`,
+          items,
+          compactBody: `已登记 ${events.length} 个关键事件。明细见卡片。`,
+        };
+      }
       return {
         ok: true,
-        data: { eventCount: events.length, triggerCount: triggers.length, triggers, summary: lines.join("\n") },
-        summary: lines.join("\n"),
+        data: { eventCount: events.length, triggerCount: triggers.length, triggers, summary: eventSummary },
+        summary: eventSummary,
       };
     },
   });
@@ -6424,6 +7136,33 @@ export function registerEventCapabilities(registry: CapabilityRegistry): void {
       }
 
       const text = renderEventPlan(plan);
+
+      if (ctx.extras) {
+        const followUps = eventPlanFollowUpActions(plan);
+        const externalTotal =
+          plan.externalTotal > 0 ? ` · 外部服务约 ${plan.externalTotal.toLocaleString("zh-CN")} 元` : "";
+        ctx.extras.visual = {
+          kind: "list_report",
+          title: "联动方案",
+          subtitle: `${plan.eventTitle} · ${plan.daysUntil} 天后`,
+          summary: `${plan.steps.length} 步 · 资金合计 ${plan.fundTotal.toLocaleString("zh-CN")} 元${externalTotal}`,
+          items: plan.steps.map((s, i) => ({
+            title: `${i + 1}. ${s.title}`,
+            badge: eventPlanStepListBadge(s),
+            tone: eventPlanStepListTone(s),
+            lines: [s.disclosure, s.funds ? `¥${s.funds.amount.toLocaleString("zh-CN")}` : "无需资金"].filter(
+              Boolean,
+            ),
+          })),
+          compactBody:
+            `「${plan.eventTitle}」共 ${plan.steps.length} 步;方案不等于已执行,请逐步确认。` +
+            (followUps.length > 0 ? ` 可先点下方按钮,或说「${followUps[0]!.say}」。` : ""),
+          footer:
+            (plan.notDoing.length > 0 ? `暂不自动办理:${plan.notDoing.slice(0, 2).join("；")}。` : "") +
+            "资金操作与外部服务须分开确认。",
+          ...(followUps.length > 0 ? { actions: followUps } : {}),
+        };
+      }
 
       await ctx.audit.append({
         ts: ctx.now,

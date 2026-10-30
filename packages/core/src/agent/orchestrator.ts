@@ -41,6 +41,7 @@ import type {
   PolicyDecision,
   PolicyReason,
   RetrievalPort,
+  Tier,
   Transaction,
 } from "../types.ts";
 import {
@@ -91,6 +92,7 @@ import {
   computePayloadHash,
   evaluatePolicy,
   buildConfirmCard,
+  buildRiskView,
   getPolicyConfig,
   mapScoreToTier,
   renderCardAsText,
@@ -147,11 +149,13 @@ import {
   fmtMoney,
   normalizeReturnWording,
   riskPreferenceFromText,
+  riskAssessmentQuizVisual,
   settlementLabel,
   yieldLabel,
   type ProductMatch,
 } from "../capabilities/wealth.ts";
 import {
+  CARD_STATUS_LABELS,
   RESTRICTION_CHANNEL_LABELS,
   buildReplacementOptions,
   checkLimitEligibility,
@@ -642,6 +646,8 @@ interface PendingSlotFill {
   askedSlots: SlotName[];
   /** 刚刚在问的槽位 */
   asking: SlotName;
+  /** 收款人已消歧完成时的 ID(避免追问备注/跳过后再次触发同名消歧) */
+  forcedPayeeId?: string;
 }
 
 class SlotFillStore {
@@ -732,7 +738,13 @@ type RoutedResult =
       presentation?: ConfirmPresentation;
     }
   | { reply: RenderedReply; reasons: PolicyReason[] }
-  | { needsSlot: NeedsSlot; reasons: PolicyReason[] }
+  | {
+      needsSlot: NeedsSlot;
+      reasons: PolicyReason[];
+      resolutionNote?: string;
+      forcedPayeeId?: string;
+      forcedTransferId?: string;
+    }
   | { turnResult: AgentTurnResult };
 
 class ClarificationStore {
@@ -769,6 +781,8 @@ class ClarificationStore {
  */
 type PendingChoiceKind =
   | "select_schedule_to_cancel"
+  /** 可撤销的转出有多笔,必须让用户指定撤哪一笔 */
+  | "select_transfer_to_cancel"
   | "select_payee_for_plan"
   | "select_holding_to_redeem"
   /** ★ 产品定位不确定时,让用户从候选里挑一只(理财场景) */
@@ -980,6 +994,11 @@ export class AgentOrchestrator {
    *   而不是静默复用。
    */
   private readonly lastPayeeBySession = new Map<string, { payeeId: string; name: string; at: number }>();
+  /** 本会话内最后一笔成功转出的回执(「撤销刚才那笔」优先指它) */
+  private readonly lastSessionTransfer = new Map<
+    string,
+    { transferId: string; payeeName: string; amount: number; ts: number; reference?: string }
+  >();
 
   private readonly clarifications = new ClarificationStore();
   /** 待选择项(如"要取消哪一个定时任务") */
@@ -2986,7 +3005,7 @@ export class AgentOrchestrator {
               abandonedCapability: abandoned.capability,
               note:
                 "用户报告卡片丢失:挂失是止损动作,优先级高于任何待确认操作。" +
-                "已放弃那个尚未执行、也未通过强验证的待确认动作,立刻执行冻结 —— " +
+                "已放弃那个尚未执行、也未通过强验证的待确认动作,立刻办理挂失 —— " +
                 "不能让『别忘了确认』挡住止损。",
             },
           });
@@ -2998,7 +3017,7 @@ export class AgentOrchestrator {
             envelope,
             intent: {
               action: "card.report_loss",
-              restatedIntent: "用户报告卡片丢失,要求挂失冻结",
+              restatedIntent: "用户报告卡片丢失,要求挂失",
               confidence: 0.95,
               ambiguities: [],
               missingSlots: [],
@@ -3368,9 +3387,12 @@ export class AgentOrchestrator {
         partial: intent,
         needsSlot: routed.needsSlot,
         reasons: routed.reasons,
+        prefaceNote: routed.resolutionNote,
+        forcedPayeeId: routed.forcedPayeeId,
       });
     }
     if ("reply" in routed) {
+      const deniedReason = routed.reasons.find((r) => r.effect === "deny" || r.ruleId === "R-WATCHLIST-BLOCK");
       return this.finalizeTurn({
         turnId,
         traceId,
@@ -3378,6 +3400,9 @@ export class AgentOrchestrator {
         ctx,
         reply: routed.reply,
         policySummary: routed.reasons,
+        ...(deniedReason
+          ? { terminal: { kind: "denied" as const, detail: routed.reply.text.split("\n")[0] ?? deniedReason.message } }
+          : {}),
       });
     }
 
@@ -5818,6 +5843,8 @@ export class AgentOrchestrator {
         partial: intent,
         needsSlot: routed.needsSlot,
         reasons: routed.reasons,
+        prefaceNote: `已确认收款人:「${payee.name}」(${payee.bankName} ${payee.maskedAccountNo ?? ""})`,
+        forcedPayeeId: payee.payeeId,
       });
     }
     if ("reply" in routed) {
@@ -5870,6 +5897,8 @@ export class AgentOrchestrator {
     };
     /** 放在回复最前面的说明(见 finishRouted 的说明) */
     preface?: string;
+    /** 反诈评估只累计该时刻之后的用户原话(澄清补槽路径用) */
+    fraudContextSince?: number;
   }): Promise<AgentTurnResult> {
     const { envelope, ctx, turnId, traceId, routed } = args;
     // ★ 前言(preface)+ 附言(followUpNote)一起施加。
@@ -5961,7 +5990,11 @@ export class AgentOrchestrator {
 
     const payloadHash = computePayloadHash(routed.capability.name, injected.input);
     const pendingId = `pending_${randomUUID().slice(0, 12)}`;
-    const fraud = this.evaluateFraud(injected.input, envelope.text, ctx, {});
+    const fraudCtx = this.collectSessionFraudContext(
+      ctx.sessionId,
+      args.fraudContextSince ?? ctx.now - 10 * 60 * 1000,
+    );
+    const fraud = this.evaluateFraud(injected.input, fraudCtx.userText, ctx, fraudCtx.signals);
     // ★ 走到"出确认卡"说明这一轮**有实质进展**,清掉追问连击计数 ——
     //   否则接下来用户对确认卡的正常来回会被误判成"又在问同一件事"。
     this.clearSlotStreak(ctx.sessionId);
@@ -6185,6 +6218,27 @@ export class AgentOrchestrator {
       );
     }
 
+    // ★ 分支:选的是"要撤销哪一笔转出"
+    if (choice.kind === "select_transfer_to_cancel") {
+      const intent: Intent = {
+        action: "transfer.cancel",
+        restatedIntent: "撤销一笔已发起的转账",
+        confidence: 1,
+        ambiguities: [],
+        missingSlots: [],
+      };
+      return this.finishRouted(
+        await this.routeCancel({
+          intent,
+          ctx,
+          traceId,
+          envelope,
+          forcedTransferId: optionId,
+        }),
+        { envelope, ctx, turnId, traceId, intent },
+      );
+    }
+
     // ★ 分支:选的是"要赎回哪只持仓" → 带着 holdingId 重新走赎回路由
     if (choice.kind === "select_holding_to_redeem") {
       const holdings = await ctx.bank.listWealthHoldings(ctx.customerId);
@@ -6257,6 +6311,7 @@ export class AgentOrchestrator {
         partial: intent,
         needsSlot: routed.needsSlot,
         reasons: routed.reasons,
+        prefaceNote: routed.resolutionNote,
       });
     }
     if ("reply" in routed) {
@@ -6295,8 +6350,12 @@ export class AgentOrchestrator {
     partial: Intent;
     needsSlot: NeedsSlot;
     reasons: PolicyReason[];
+    /** 追问前先说明的一步进展(如刚选定收款人) */
+    prefaceNote?: string;
+    /** 与 prefaceNote 配套:后续补槽路由时带上,避免收款人再次消歧 */
+    forcedPayeeId?: string;
   }): Promise<AgentTurnResult> {
-    const { envelope, ctx, turnId, traceId, action, partial, needsSlot, reasons } = args;
+    const { envelope, ctx, turnId, traceId, action, partial, needsSlot, reasons, prefaceNote, forcedPayeeId } = args;
 
     // 冻结当前进度:下一轮只补这一个槽位
     const priorFill = this.slotFills.get(ctx.sessionId, ctx.now);
@@ -6330,6 +6389,7 @@ export class AgentOrchestrator {
       partial,
       askedSlots: [...new Set([...priorAsked, needsSlot.slot])],
       asking: needsSlot.slot,
+      ...(forcedPayeeId ? { forcedPayeeId } : {}),
     });
     // 追问期间不应再有别的焦点
     this.clarifications.delete(ctx.sessionId);
@@ -6337,6 +6397,10 @@ export class AgentOrchestrator {
 
     const understood = this.describeUnderstood(partial);
     const lines: string[] = [];
+    if (prefaceNote) {
+      lines.push(prefaceNote);
+      lines.push("");
+    }
     if (isRepeat) {
       lines.push(
         `这个问题我好像已经问过一次了 —— 可能是刚才那句我没接住,不是您的问题。`,
@@ -6367,15 +6431,23 @@ export class AgentOrchestrator {
     //
     //   因此这里为这类槽位做一次"正文渲染":question 只是标题,
     //   真正的正文由渲染器产出。新增此类槽位时,必须同时提供渲染器。
-    const body = this.renderSlotBody(needsSlot.slot);
-    if (body) {
+    if (needsSlot.slot === "answers") {
+      const stepIndex = (this.answerBuffers.get(ctx.sessionId) ?? []).length;
+      const step = riskAssessmentQuizVisual(stepIndex);
+      if (ctx.extras && step) ctx.extras.visual = step;
       lines.push(needsSlot.question);
-      lines.push("");
-      lines.push(...body);
+      if (step?.compactBody) lines.push(step.compactBody);
     } else {
-      lines.push(needsSlot.question);
-      if (needsSlot.examples && needsSlot.examples.length > 0) {
-        lines.push(`例如:${needsSlot.examples.map((e) => `「${e}」`).join("、")}`);
+      const body = this.renderSlotBody(needsSlot.slot);
+      if (body) {
+        lines.push(needsSlot.question);
+        lines.push("");
+        lines.push(...body);
+      } else {
+        lines.push(needsSlot.question);
+        if (needsSlot.examples && needsSlot.examples.length > 0) {
+          lines.push(`例如:${needsSlot.examples.map((e) => `「${e}」`).join("、")}`);
+        }
       }
     }
     if (needsSlot.optional) {
@@ -6408,7 +6480,9 @@ export class AgentOrchestrator {
         ...(isRepeat ? { repeatOfSameSlot: true, askCount: streakCount } : {}),
         note:
           "追问式槽位补全:已把'理解到的部分'冻结在会话里,下一轮只补这个槽位,不再从零解析。" +
-          (body ? "该槽位的取值形态为固定清单,已把清单正文一并展示(否则追问不可回答)。" : "") +
+          (needsSlot.slot === "answers"
+            ? "风评以逐题卡片展示,选项可点选。"
+            : "") +
           (isRepeat
             ? "★ 这是同一槽位的**第二次追问**:已改为承认问过、换更具体的问法,并给出「转人工」这条退出通道 —— 原样重复只会让用户觉得没在听。"
             : ""),
@@ -6431,23 +6505,15 @@ export class AgentOrchestrator {
    * ★ 返回 null 表示这个槽位不需要正文(金额、收款人、日期这类)。
    *   返回数组表示"必须展示的内容",缺少它用户无法回答。
    */
-  private renderSlotBody(slot: SlotName): string[] | null {
-    if (slot === "answers") {
-      const lines: string[] = [];
-      for (const [i, q] of ASSESSMENT_QUESTIONS.entries()) {
-        lines.push(`${i + 1}. ${q.question}`);
-        for (const o of q.options) lines.push(`   ${o.optionId}. ${o.label}`);
-        lines.push("");
-      }
-      lines.push("作答方式(任选其一):");
-      lines.push("· 一次答完:按顺序给出 6 个字母,可连写,例如「bcccbd」或「b c c c b d」;");
-      lines.push("· 逐题作答:每次回复一个字母,例如「b」,系统将提示剩余题目;");
-      lines.push("· 带题号作答:「1.b 2.c 3.c 4.c 5.b 6.d」。");
-      lines.push("");
-      lines.push("请如实作答。评级偏高可能导致购买超出承受能力的产品。");
-      return lines;
-    }
+  private renderSlotBody(_slot: SlotName): string[] | null {
     return null;
+  }
+
+  /** 风评逐题:在 ctx 上挂当前题卡片,并返回短引导语。 */
+  private attachAssessmentStepVisual(ctx: ExecutionContext, stepIndex: number): string {
+    const step = riskAssessmentQuizVisual(stepIndex);
+    if (ctx.extras && step) ctx.extras.visual = step;
+    return step?.compactBody ?? "请选一项作答。";
   }
 
   /**
@@ -6574,6 +6640,7 @@ export class AgentOrchestrator {
 
     // ---- 可选槽位:允许用户明确跳过 ----
     if (fill.asking === "memo" && SLOT_SKIP_WORDS.test(trimmed)) {
+      merged.memoPromptSkipped = true;
       await ctx.audit.append({
         ts: ctx.now,
         traceId,
@@ -6583,15 +6650,38 @@ export class AgentOrchestrator {
         type: "clarification_requested",
         payload: { kind: "slot_fill:memo", resolution: "user_skipped", note: "用户选择跳过备注,继续办理。" },
       });
-      const routedSkip = await this.routeIntent({ intent: merged, ctx, traceId, envelope });
+      const routedSkip = await this.routeIntent({
+        intent: merged,
+        ctx,
+        traceId,
+        envelope,
+        ...(fill.forcedPayeeId ? { forcedPayeeId: fill.forcedPayeeId } : {}),
+      });
       if ("turnResult" in routedSkip) return routedSkip.turnResult;
       if ("needsSlot" in routedSkip) {
-        return this.askForSlot({ envelope, ctx, turnId, traceId, action: merged.action, partial: merged, needsSlot: routedSkip.needsSlot, reasons: routedSkip.reasons });
+        return this.askForSlot({
+          envelope,
+          ctx,
+          turnId,
+          traceId,
+          action: merged.action,
+          partial: merged,
+          needsSlot: routedSkip.needsSlot,
+          reasons: routedSkip.reasons,
+          prefaceNote: routedSkip.resolutionNote,
+        });
       }
       if ("reply" in routedSkip) {
         return this.finalizeTurn({ turnId, traceId, envelope, ctx, reply: routedSkip.reply, policySummary: routedSkip.reasons });
       }
-      return this.settleCapabilityCall({ envelope, ctx, turnId, traceId, routed: routedSkip });
+      return this.settleCapabilityCall({
+        envelope,
+        ctx,
+        turnId,
+        traceId,
+        routed: routedSkip,
+        fraudContextSince: fill.createdAt,
+      });
     }
 
     // ---- 用解析器理解这个片段(复用全部既有抽取能力)----
@@ -6644,7 +6734,9 @@ export class AgentOrchestrator {
         break;
       }
       case "memo": {
-        merged.memo = trimmed.slice(0, 200);
+        const parsed = parseMemoFix(trimmed);
+        merged.memo = (parsed != null ? parsed : trimmed).slice(0, 200);
+        merged.memoPromptSkipped = false;
         break;
       }
       case "participants": {
@@ -6740,7 +6832,13 @@ export class AgentOrchestrator {
     }
 
     // 缺槽位就继续问下一个;齐了就正常往下走
-    const routed = await this.routeIntent({ intent: merged, ctx, traceId, envelope });
+    const routed = await this.routeIntent({
+      intent: merged,
+      ctx,
+      traceId,
+      envelope,
+      ...(fill.forcedPayeeId ? { forcedPayeeId: fill.forcedPayeeId } : {}),
+    });
     if ("turnResult" in routed) return routed.turnResult;
     if ("needsSlot" in routed) {
       return this.askForSlot({
@@ -6752,6 +6850,8 @@ export class AgentOrchestrator {
         partial: merged,
         needsSlot: routed.needsSlot,
         reasons: routed.reasons,
+        prefaceNote: routed.resolutionNote,
+        forcedPayeeId: fill.forcedPayeeId,
       });
     }
     if ("reply" in routed) {
@@ -6775,7 +6875,7 @@ export class AgentOrchestrator {
       "wealth.compare": "要对比理财产品",
       "wealth.list_products": "要看理财产品",
       // ---- 卡片管理(场景四)----
-      "card.report_loss": "要挂失冻结卡片",
+      "card.report_loss": "要挂失卡片",
       "card.replace": "要补办卡片",
       "card.activate": "要激活新卡",
       "card.limit_adjust": "要申请调整额度",
@@ -6827,6 +6927,8 @@ export class AgentOrchestrator {
     forcedPayeeId?: string;
     /** ★ 用户在"待选择项"里选定的定时任务 ID(取消定时转账用) */
     forcedScheduleId?: string;
+    /** ★ 用户在待选列表里选定的可撤销转账 transferId */
+    forcedTransferId?: string;
   }): Promise<
     | {
         capability: RegisteredCapability;
@@ -6837,7 +6939,13 @@ export class AgentOrchestrator {
       }
     | { reply: RenderedReply; reasons: PolicyReason[] }
     /** ★ 还缺信息 → 主循环转成"复述已理解部分 + 追问" */
-    | { needsSlot: NeedsSlot; reasons: PolicyReason[] }
+    | {
+        needsSlot: NeedsSlot;
+        reasons: PolicyReason[];
+        resolutionNote?: string;
+        forcedPayeeId?: string;
+        forcedTransferId?: string;
+      }
     /** 转人工等"非能力调用"的终局响应,直接作为回合结果返回 */
     | { turnResult: AgentTurnResult }
   > {
@@ -6929,6 +7037,8 @@ export class AgentOrchestrator {
         };
       case "account.insights":
         return { capability: this.deps.registry.mustGet("account.insights"), input: {} };
+      case "account.payday_brief":
+        return { capability: this.deps.registry.mustGet("account.payday_brief"), input: {} };
       case "account.health_label":
         return { capability: this.deps.registry.mustGet("account.health_label"), input: {} };
 
@@ -7400,28 +7510,19 @@ export class AgentOrchestrator {
           });
 
           const buffered = this.answerBuffers.get(ctx.sessionId) ?? accumulatedSoFar;
-          const stillMissing = ASSESSMENT_QUESTIONS.filter(
-            (q) => !buffered.some((a) => a.questionId === q.questionId),
-          );
 
+          const stepHint = this.attachAssessmentStepVisual(ctx, buffered.length);
           return {
             reply: {
               text: [
-                `本次作答未采用:${diagnosis.message}`,
-                "",
+                `这次选项没接上:${diagnosis.message}`,
                 buffered.length > 0
-                  ? `已经记下的作答保留着(${buffered.length} / ${ASSESSMENT_QUESTIONS.length} 题),不用重头再来。`
-                  : "您之前的作答我没有丢掉,不用重头再来。",
-                "",
-                "请按以下方式作答:",
-                "   · 一次答完:按顺序打 6 个字母,连写也行 ——「bcccbd」或「b c c c b d」;",
-                "   · 逐题作答:一次回一个字母(如「b」),我会告诉您还差哪几题;",
-                "   · 带题号:「1.b 2.c 3.c 4.c 5.b 6.d」。",
-                "",
-                stillMissing.length > 0
-                  ? `还差 ${stillMissing.length} 题:${stillMissing.map((q) => q.question).join("、")}`
-                  : "六题已齐,直接把 6 个字母重发一次即可。",
-              ].join("\n"),
+                  ? `已记下 ${buffered.length}/${ASSESSMENT_QUESTIONS.length} 题,不用重头答。`
+                  : "",
+                stepHint,
+              ]
+                .filter(Boolean)
+                .join("\n"),
               promptFor: { kind: "clarify" },
             },
             reasons: [
@@ -7450,10 +7551,7 @@ export class AgentOrchestrator {
           return {
             needsSlot: {
               slot: "answers",
-              question: "风险承受能力测评(共 6 题)",
-              // ★ 这里刻意**不给 examples**:题目正文由主循环的 renderSlotBody 渲染。
-              //   早期版本把 examples 当成正文("例如「b c c c b d」"),
-              //   结果用户只看到一句"请按顺序作答",题目一道都没出现。
+              question: "风险测评 · 请选一项",
               optional: false,
             } satisfies NeedsSlot,
             reasons: [
@@ -7472,22 +7570,11 @@ export class AgentOrchestrator {
         );
         if (missing.length > 0) {
           this.slotFills.delete(ctx.sessionId); // 焦点改由本分支自己维持
+          const stepHint = this.attachAssessmentStepVisual(ctx, accumulated.length);
           return {
             reply: {
-              text: [
-                `已记下您的作答(${accumulated.length} / ${ASSESSMENT_QUESTIONS.length} 题)。`,
-                "",
-                `还差 ${missing.length} 题:`,
-                "",
-                ...missing.flatMap((q) => [
-                  `${q.question}`,
-                  ...q.options.map((o) => `   ${o.optionId}. ${o.label}`),
-                ]),
-                "",
-                "测评须六道题全部作答后方可评定等级。缺题不评级。",
-                `回复这 ${missing.length} 题的字母即可(按上面顺序,如「${missing.map(() => "a").join(" ")}」)。`,
-              ].join("\n"),
-              promptFor: { kind: "none" },
+              text: [`已记下 ${accumulated.length}/${ASSESSMENT_QUESTIONS.length} 题。`, stepHint].join("\n"),
+              promptFor: { kind: "clarify" },
             },
             reasons: [
               {
@@ -7988,21 +8075,33 @@ export class AgentOrchestrator {
             "★ 同时已把这笔申购(产品+金额)存入 pendingWealthPurchase,测评完成后自动接续,不再让用户重说。",
         },
       });
+      this.slotFills.put(ctx.sessionId, {
+        sessionId: ctx.sessionId,
+        createdAt: ctx.now,
+        expiresAt: ctx.now + 30 * 60 * 1000,
+        action: "wealth.risk_assess",
+        partial: {
+          action: "wealth.risk_assess",
+          restatedIntent: "用户正在作答风险测评问卷",
+          confidence: 1,
+          ambiguities: [],
+          missingSlots: [],
+        },
+        askedSlots: ["answers"],
+        asking: "answers",
+      });
+      this.answerBuffers.delete(ctx.sessionId);
+      const assessIntro = this.attachAssessmentStepVisual(ctx, 0);
       return {
         reply: {
           text: [
             profile.expired
-              ? "您的风险测评已经超过一年了,按规定需要重新测评才能申购。"
-              : "按监管规定,首次购买理财产品前必须先完成风险承受能力测评。",
-            "",
-            `拟申购「${product.name}」(${product.riskLevel} ${PRODUCT_RISK_LABELS[product.riskLevel]}),` +
-              `${amount.toLocaleString("zh-CN")} 元。测评共 6 题。`,
-            "",
-            "该笔申购已暂存。测评完成后可直接继续,无需重复说明产品与金额。",
-            "",
-            "请回复「做风险测评」开始。测评结果仅用于产品适配,不影响浏览。",
+              ? "测评已过期,需重新测评后才能申购。"
+              : "首次购买理财须先完成风险测评(约 1 分钟)。",
+            `已记下拟申购「${product.name}」${amount.toLocaleString("zh-CN")} 元,测完接着办,不用重说。`,
+            assessIntro,
           ].join("\n"),
-          promptFor: { kind: "none" },
+          promptFor: { kind: "clarify" },
         },
         reasons: [
           {
@@ -8611,22 +8710,32 @@ export class AgentOrchestrator {
     matches: ProductMatch[],
     options?: { preferenceNote?: string },
   ): RoutedResult {
+    const shown = matches.slice(0, 5);
+    if (ctx.extras) {
+      ctx.extras.visual = {
+        kind: "list_report",
+        title: "请确认要买哪一只",
+        subtitle: options?.preferenceNote ?? "买理财不可撤回,请勿猜选",
+        items: shown.map((m, i) => {
+          const p = m.product;
+          return {
+            title: `${i + 1}. ${p.name}`,
+            value: yieldLabel(p),
+            badge: p.riskLevel,
+            lines: [
+              `${PRODUCT_RISK_LABELS[p.riskLevel]} · 起购 ${p.minAmount.toLocaleString("zh-CN")} 元 · ${p.productCode}`,
+            ],
+          };
+        }),
+        compactBody: "点下方序号或回复「1」「2」确认产品。",
+        footer: "历史业绩不代表未来表现,不承诺保本保收益。",
+        actions: shown.map((_m, i) => ({ label: String(i + 1), say: String(i + 1) })),
+      };
+    }
+
     const lines: string[] = [];
-    if (options?.preferenceNote) {
-      lines.push(options.preferenceNote);
-      lines.push("");
-    }
-    lines.push("我不想猜错 —— 买理财是不可逆的,买错了要按净值赎回,亏了就是亏了。请确认是下面哪一只:");
-    lines.push("");
-    for (const [i, m] of matches.entries()) {
-      const p = m.product;
-      lines.push(
-        `  ${i + 1}. ${p.name}(${p.productCode})· ${p.riskLevel} ${PRODUCT_RISK_LABELS[p.riskLevel]} · ` +
-          `${yieldLabel(p)} · 起购 ${p.minAmount.toLocaleString("zh-CN")} 元 · 到账 ${p.settlement}`,
-      );
-    }
-    lines.push("");
-    lines.push("回复序号(如「1」)或产品名都行。");
+    if (options?.preferenceNote) lines.push(options.preferenceNote);
+    lines.push("请点选要买的哪一只(或回复序号)。");
 
     // ★ 必须把这个选择登记成"待选择项"。
     //
@@ -8983,6 +9092,7 @@ export class AgentOrchestrator {
         },
         needsSlot: routed.needsSlot,
         reasons: routed.reasons,
+        prefaceNote: routed.resolutionNote,
       });
       return args.preface ? { ...asked, reply: `${args.preface}\n\n${asked.reply}` } : asked;
     }
@@ -9189,7 +9299,7 @@ export class AgentOrchestrator {
         lines.push("  2. **只有换号补卡才需要重新设置交易密码** —— 保留原号沿用原密码。");
       lines.push("");
       lines.push("要现在办的话,先确认一件事:那张卡**挂失了吗**?");
-      lines.push("  · 还没挂失 → 回复「卡丢了先挂失」,我会立刻冻结它(这是防被盗刷的第一步);");
+      lines.push("  · 还没挂失 → 回复「卡丢了先挂失」,我会立刻办理挂失(这是防被盗刷的第一步);");
       lines.push("  · 已挂失   → 回复「补办尾号XXXX那张」,我会把两种方案的差异再列一遍让您选。");
 
       return {
@@ -9206,24 +9316,72 @@ export class AgentOrchestrator {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // ★★ 纪律一:挂失先执行,不追问细节
+    // ★★ 挂失:先确认是哪一张,再立刻办理(仍不拖补办细节)
     //
-    //   这张卡还没定位到也不影响冻结 —— 未指名时冻结名下全部卡。
-    //   "宁可多冻一张,不可漏冻一张":多冻一张的代价是客户多打一次客服电话解挂,
-    //   漏冻一张的代价可能是卡被刷爆。两者的量级完全不同。
+    //   未指名时**不能**把名下全部卡都挂失 —— 客户通常只丢一张,
+    //   误挂失全部卡的代价(自动扣款全停、每张都要解挂/补卡)远大于多问一句。
+    //   只有名下**仅剩一张**还可挂失的卡时,才自动认定就是这张。
     // ══════════════════════════════════════════════════════════════════════
     if (intent.action === "card.report_loss") {
+      const losable = (await ctx.bank.listCards(ctx.customerId)).filter(
+        (c) => c.status !== "closed" && c.status !== "lost",
+      );
+
+      if (!located.card) {
+        if (losable.length === 0) {
+          return {
+            reply: {
+              text:
+                "您名下目前没有还可以办理挂失的卡片(可能都已挂失或已销卡)。\n\n" +
+                "如需补卡或解挂,请说明尾号;也可以说「我有哪些卡」查看当前状态。",
+              promptFor: { kind: "none" },
+            },
+            reasons: [{ ruleId: "CARD-LOSS-NONE", message: "没有可挂失的卡片" }],
+          };
+        }
+        if (losable.length === 1) {
+          located.card = losable[0]!;
+        } else {
+          const lines: string[] = [];
+          lines.push("需要先确认**要挂失哪一张卡**。");
+          lines.push("挂失后该卡将不能刷卡、取现、线上支付,绑定的自动扣款也会失败。");
+          lines.push("");
+          for (const [i, c] of losable.entries()) {
+            lines.push(
+              `${i + 1}. ${c.productName} · ${c.kindLabel} 尾号 ${c.last4} · ${CARD_STATUS_LABELS[c.status]}`,
+            );
+          }
+          lines.push("");
+          lines.push("请回复序号(如「1」)或尾号(如「尾号 3344」);不确定可以先说「我有哪些卡」。");
+
+          this.rememberShownCardList(
+            "card.list",
+            { cards: losable.map((c) => ({ cardId: c.cardId, last4: c.last4 })) },
+            ctx.sessionId,
+            ctx.now,
+          );
+
+          return {
+            reply: { text: lines.join("\n"), promptFor: { kind: "none" } },
+            reasons: [
+              {
+                ruleId: "CLARIFY-CARD-LOSS",
+                message: `用户要挂失但未指明卡片,名下有 ${losable.length} 张可挂失卡,必须先确认`,
+              },
+            ],
+          };
+        }
+      }
+
       const input: Record<string, unknown> = {
-        ...(located.card ? { cardId: located.card.cardId } : {}),
+        cardId: located.card.cardId,
         ...(cardRef.statement ? { scenario: cardRef.statement } : {}),
         ...(intent.memo ? { scenario: intent.memo } : {}),
       };
       return {
         capability: this.deps.registry.mustGet("card.report_loss"),
         input,
-        resolutionNote: located.card
-          ? `我理解您要挂失的是「${located.card.productName}」尾号 ${located.card.last4}。`
-          : "您没指明是哪一张 —— 挂失是止损动作,我会**先冻结您名下全部卡片**。",
+        resolutionNote: `我理解您要挂失的是「${located.card.productName}」尾号 ${located.card.last4}。`,
       };
     }
 
@@ -9392,6 +9550,13 @@ export class AgentOrchestrator {
       if (hit) return { card: hit, evidence: `尾号 ${hit.last4}` };
       // 说了尾号但查不到:如实说明,绝不退化成"随便挑一张"
       return { card: null };
+    }
+
+    const tailFromText =
+      text.match(/尾号\s*(\d{4})/)?.[1] ?? text.match(/挂失(?:尾号)?\s*(\d{4})/)?.[1];
+    if (tailFromText) {
+      const hit = cards.find((c) => c.last4 === tailFromText);
+      if (hit) return { card: hit, evidence: `尾号 ${hit.last4}` };
     }
 
     // ③ 位置指代:只在"刚展示过的卡片列表"里成立
@@ -10623,7 +10788,13 @@ export class AgentOrchestrator {
       }
     | { reply: RenderedReply; reasons: PolicyReason[] }
     /** ★ 还缺信息 → 主循环转成"复述已理解部分 + 追问" */
-    | { needsSlot: NeedsSlot; reasons: PolicyReason[] }
+    | {
+        needsSlot: NeedsSlot;
+        reasons: PolicyReason[];
+        resolutionNote?: string;
+        forcedPayeeId?: string;
+        forcedTransferId?: string;
+      }
     /** 转人工等"非能力调用"的终局响应,直接作为回合结果返回 */
     | { turnResult: AgentTurnResult }
   > {
@@ -10796,6 +10967,72 @@ export class AgentOrchestrator {
       };
     }
 
+    // ---- 名单命中:不必再追问备注,直接告知阻断(演示 S6 第二幕) ----
+    if (payeeId && intent.amount?.value != null && fromAccountId) {
+      const payeeRecord = await this.deps.bank.getPayee(ctx.customerId, payeeId);
+      const preflightInput: Record<string, unknown> = {
+        fromAccountId,
+        payeeId,
+        payeeName: payeeName || (intent.payee?.name ?? intent.payee?.raw ?? ""),
+        amount: intent.amount.value,
+        currency: intent.amount.currency,
+        ...(payeeRecord?.maskedAccountNo ? { maskedAccountNo: payeeRecord.maskedAccountNo } : {}),
+        ...(payeeRecord?.phone ? { phone: payeeRecord.phone } : {}),
+        ...(payeeRecord?.bankCode ? { bankCode: payeeRecord.bankCode } : {}),
+        ...(payeeRecord?.bankName ? { bankName: payeeRecord.bankName } : {}),
+      };
+      const injectedPreflight = await injectRiskSignals(preflightInput, ctx);
+      const preflightDecision = evaluatePolicy({
+        capability: toCapabilitySpec(this.deps.registry.mustGet("transfer.submit")),
+        input: injectedPreflight.input,
+        ctx,
+        sessionIntents: this.sessions.intents(ctx.sessionId),
+        presentation: buildPresentation("transfer.submit", injectedPreflight.input),
+        frequency: this.frequency.peek({
+          customerId: ctx.customerId,
+          capability: this.deps.registry.mustGet("transfer.submit"),
+          now: ctx.now,
+        }),
+      });
+      if (preflightDecision.effect === "deny") {
+        await ctx.audit.append({
+          ts: ctx.now,
+          traceId: args.traceId,
+          sessionId: ctx.sessionId,
+          customerId: ctx.customerId,
+          channel: ctx.channel,
+          type: "policy_evaluated",
+          payload: {
+            capability: "transfer.submit",
+            effect: "deny",
+            tier: preflightDecision.tier,
+            reasons: summarizePolicyForAudit(preflightDecision.reasons),
+            inputSnapshot: stripPrivateFields(injectedPreflight.input),
+            note: "收款人已确定且命中硬阻断规则,不再追问备注,避免让客户误以为还能继续确认。",
+          },
+        });
+        return {
+          reply: renderDeniedReply({ decision: preflightDecision, capabilities: ctx.channelCapabilities }),
+          reasons: [...injectedPreflight.reasons, ...preflightDecision.reasons],
+        };
+      }
+    }
+
+    // ---- 转账备注:出确认前先问一句(可跳过),不在确认卡上教用户点按钮 ----
+    if (!intent.memo?.trim() && !intent.memoPromptSkipped) {
+      return {
+        needsSlot: {
+          slot: "memo",
+          question: "要给这笔转账写个备注吗?",
+          examples: ["生活费", "房租", "买菜"],
+          optional: true,
+        },
+        reasons: [{ ruleId: "CLARIFY-MEMO", message: "未提供备注,出确认前先追问(可跳过)" }],
+        ...(resolutionNote ? { resolutionNote } : {}),
+        ...(payeeId ? { forcedPayeeId: payeeId } : {}),
+      };
+    }
+
     // ---- 备注净化 ----
     const memoResult = sanitizeMemo(intent.memo);
 
@@ -10842,52 +11079,173 @@ export class AgentOrchestrator {
     };
   }
 
+  /** 24 小时内、带电子回执、仍可走撤销能力的转出流水 */
+  private async listCancellableTransferTransactions(ctx: ExecutionContext): Promise<Transaction[]> {
+    const txs = await this.deps.bank.listTransactions(ctx.customerId, {
+      from: ctx.now - 24 * 3600 * 1000,
+      direction: "out",
+      category: "转账",
+      limit: 50,
+    });
+    // ★ 种子数据里的历史「转账」只有流水、没有 TRF 回执 —— 不能当撤销对象,
+    //   否则会把演示用的「给老妈转生活费」误当成可撤销的那一笔。
+    return txs.filter((t) => typeof t.transferId === "string" && t.transferId.length > 0);
+  }
+
+  private cancelPayloadFromTransaction(t: Transaction): Record<string, unknown> {
+    return {
+      transferId: t.transferId!,
+      reason: "用户请求撤销",
+      ...(t.reference ? { __transferReference: t.reference } : {}),
+      __transferPayee: t.counterpartyName,
+      __transferAmount: t.amount,
+      __transferTs: t.ts,
+      ...(t.memo ? { __transferMemo: t.memo } : {}),
+    };
+  }
+
   /** 撤销转账路由 */
   private async routeCancel(args: {
     intent: Intent;
     ctx: ExecutionContext;
     traceId: string;
     envelope: MessageEnvelope;
+    forcedTransferId?: string;
   }): Promise<
-    | { capability: RegisteredCapability; input: Record<string, unknown> }
+    | { capability: RegisteredCapability; input: Record<string, unknown>; resolutionNote?: string }
     | { reply: RenderedReply; reasons: PolicyReason[] }
   > {
-    const { ctx } = args;
-    // 从近期交易中找出最近一笔转出
-    const recent = await this.deps.bank.listTransactions(ctx.customerId, {
-      from: ctx.now - 24 * 3600 * 1000,
-      direction: "out",
-      limit: 5,
-    });
-    const lastTransfer = recent.find((t) => t.category === "转账");
-    if (!lastTransfer) {
+    const { ctx, intent, envelope, forcedTransferId } = args;
+    const userText = envelope.text.trim();
+
+    let pool = await this.listCancellableTransferTransactions(ctx);
+
+    if (pool.length === 0) {
       return {
         reply: {
-          text: "我在最近 24 小时里没找到可撤销的转账。请告诉我流水号,或说「查一下我的转账记录」。",
+          text:
+            "我在最近 24 小时里没找到**还在可撤销窗口内、且能对应到回执**的转账。\n\n" +
+            "如果您刚转完,请先确认那一笔已经办妥;也可以告诉我流水号(REF…),或者说「查一下转账记录」。",
           promptFor: { kind: "none" },
         },
-        reasons: [{ ruleId: "CANCEL-NOT-FOUND", message: "未找到可撤销的转账" }],
+        reasons: [{ ruleId: "CANCEL-NOT-FOUND", message: "没有带可撤销回执的近期转账" }],
       };
     }
 
-    // ★ 撤销确认卡必须说明"撤的是哪一笔、多少钱、转给谁、什么时候"。
-    //   早期只把 transferId 塞进卡片,用户看到的是一串内部编号 ——
-    //   他根本无法判断自己撤的是不是那一笔。这是确认信息不完整,
-    //   而确认卡存在的全部意义就是让用户核对。
-    return {
-      capability: this.deps.registry.mustGet("transfer.cancel"),
-      input: {
-        // ★ 优先用回执编号(TRF_…):流水上现在回填了它,银行侧按回执定位不再依赖任何猜测。
-        //   旧数据没有 transferId 时退回 transactionId —— cancelTransfer 两种编号都能解析。
-        transferId: lastTransfer.transferId ?? lastTransfer.transactionId,
-        reason: "用户请求撤销",
-        // ★ 卡片要显示客户刚才在回执上看到的那个流水号(REF…),而不是内部 TXN 编号。
-        ...(lastTransfer.reference ? { __transferReference: lastTransfer.reference } : {}),
-        __transferPayee: lastTransfer.counterpartyName,
-        __transferAmount: lastTransfer.amount,
-        __transferTs: lastTransfer.ts,
-        ...(lastTransfer.memo ? { __transferMemo: lastTransfer.memo } : {}),
+    if (forcedTransferId) {
+      pool = pool.filter((t) => t.transferId === forcedTransferId);
+      if (pool.length === 0) {
+        return {
+          reply: {
+            text: "您选的那笔转账已经找不到或已不能撤销了,请重新说一次要撤哪一笔,或说「查转账记录」。",
+            promptFor: { kind: "none" },
+          },
+          reasons: [{ ruleId: "CANCEL-TRANSFER-MISSING", message: "用户选定的 transferId 无效" }],
+        };
+      }
+    }
+
+    const refMatch = userText.match(/REF[A-Z0-9]{6,}/i);
+    if (refMatch) {
+      const ref = refMatch[0]!.toUpperCase();
+      const byRef = pool.filter((t) => (t.reference ?? "").toUpperCase() === ref);
+      if (byRef.length === 1) pool = byRef;
+      else if (byRef.length > 1) pool = byRef;
+    }
+
+    const payeeHint = intent.payee?.name ?? intent.payee?.alias ?? intent.payee?.raw;
+    if (payeeHint && pool.length > 1) {
+      const matched = pool.filter((t) => scoreName(payeeHint, t.counterpartyName).score >= 0.75);
+      if (matched.length === 1) pool = matched;
+      else if (matched.length > 1) pool = matched;
+    }
+
+    const amountHint = intent.amount?.value;
+    if (amountHint != null && amountHint > 0 && pool.length > 1) {
+      const matched = pool.filter((t) => Math.abs(t.amount - amountHint) < 0.01);
+      if (matched.length >= 1) pool = matched;
+    }
+
+    const vagueRecent = /(刚才|刚刚|上一笔|刚转|最后一笔|这笔|刚才那笔|刚办)/.test(userText);
+    const sessionLast = this.lastSessionTransfer.get(ctx.sessionId);
+    if (vagueRecent && sessionLast && pool.length > 1) {
+      const prefer = pool.find((t) => t.transferId === sessionLast.transferId);
+      if (prefer) pool = [prefer];
+    }
+
+    if (pool.length === 1) {
+      const t = pool[0]!;
+      return {
+        capability: this.deps.registry.mustGet("transfer.cancel"),
+        input: this.cancelPayloadFromTransaction(t),
+        resolutionNote: `要撤销的是这笔:向「${t.counterpartyName}」转出 ¥${t.amount.toLocaleString("zh-CN")}(${formatDateForUser(t.ts)})。`,
+      };
+    }
+
+    const describe = (t: Transaction, i: number) => ({
+      id: t.transferId!,
+      label: `向「${t.counterpartyName}」¥${t.amount.toLocaleString("zh-CN")}`,
+      subLabel: `${formatDateForUser(t.ts)}${t.reference ? ` · ${t.reference}` : ""}${t.memo ? ` · ${t.memo}` : ""}`,
+      selectableTexts: [
+        String(i + 1),
+        t.counterpartyName,
+        String(t.amount),
+        ...(t.memo ? [t.memo] : []),
+        ...(t.reference ? [t.reference] : []),
+      ],
+    });
+
+    const options = pool.map(describe);
+    this.choices.put(ctx.sessionId, {
+      sessionId: ctx.sessionId,
+      kind: "select_transfer_to_cancel",
+      createdAt: ctx.now,
+      expiresAt: ctx.now + 5 * 60 * 1000,
+      question: "要撤销哪一笔转账?",
+      options,
+    });
+
+    await args.ctx.audit.append({
+      ts: ctx.now,
+      traceId: args.traceId,
+      sessionId: ctx.sessionId,
+      customerId: ctx.customerId,
+      channel: ctx.channel,
+      type: "clarification_requested",
+      payload: {
+        kind: "select_transfer_to_cancel",
+        candidateCount: pool.length,
+        candidates: options.map((o) => ({ id: o.id, label: o.label, subLabel: o.subLabel })),
+        note: "可撤销的转出有多笔,列出供用户选择 —— 绝不猜测要撤哪一笔。",
       },
+    });
+
+    const lines: string[] = [];
+    lines.push(`最近有 ${pool.length} 笔转账还在可撤销窗口内,您要撤销哪一笔?`);
+    lines.push("");
+    pool.forEach((t, i) => {
+      lines.push(
+        `  ${i + 1}. 向「${t.counterpartyName}」转 ¥${t.amount.toLocaleString("zh-CN")} · ${formatDateForUser(t.ts)}`,
+      );
+      if (t.memo) lines.push(`     备注:${t.memo}`);
+      if (t.reference) lines.push(`     流水号:${t.reference}`);
+    });
+    lines.push("");
+    lines.push("回复序号(如「1」),或说出收款人/金额/流水号来指定。");
+
+    return {
+      reply: {
+        text: lines.join("\n"),
+        promptFor: {
+          kind: "clarify",
+          candidates: options.map((o) => ({
+            id: o.id,
+            label: o.label,
+            ...(o.subLabel ? { subLabel: o.subLabel } : {}),
+          })),
+        },
+      },
+      reasons: [{ ruleId: "CANCEL-TRANSFER-WHICH", message: `有 ${pool.length} 笔可撤销转出,需用户指定` }],
     };
   }
 
@@ -11331,6 +11689,19 @@ export class AgentOrchestrator {
      *   · 只有真的发生了资金变动才标 moneyMoved,界面据此把
      *     "已办结"与"已备好待确认"区分开(后者一分钱都还没动)。
      */
+    if (outcome.ok && capability.name === "transfer.submit") {
+      const tid = data?.["transferId"];
+      if (typeof tid === "string" && tid.length > 0) {
+        this.lastSessionTransfer.set(ctx.sessionId, {
+          transferId: tid,
+          payeeName: String(data?.["payeeName"] ?? input["payeeName"] ?? ""),
+          amount: Number(data?.["amount"] ?? input["amount"] ?? 0),
+          ts: ctx.now,
+          ...(typeof data?.["reference"] === "string" ? { reference: data["reference"] as string } : {}),
+        });
+      }
+    }
+
     if (ctx.extras && outcome.ok) {
       ctx.extras.executedCapability = capability.name;
       ctx.extras.executed = true;
@@ -11870,6 +12241,8 @@ export class AgentOrchestrator {
       traceId,
       reply: outReply.text,
       ...(outReply.card ? { card: outReply.card } : {}),
+      // 反诈块随回复一起走:富交互终端据此画警示卡,而不是把提醒埋在长段文字里
+      ...(outReply.fraud ? { fraud: outReply.fraud } : {}),
       ...(outReply.promptFor ? { promptFor: outReply.promptFor } : {}),
       ...(policySummary ? { policySummary } : {}),
       ...(terminal ? { terminal } : {}),
@@ -12224,6 +12597,24 @@ export class AgentOrchestrator {
     };
   }
 
+  /**
+   * 同一段转账办理里,用户可能分多轮补收款人/备注。
+   * 反诈特征往往出现在**第一轮**原话里;若只拿最后一轮「跳过」评估,演示剧本(S6)会完全失效。
+   */
+  private collectSessionFraudContext(
+    sessionId: string,
+    sinceTs: number,
+  ): { userText: string; signals: ReturnType<typeof mergeFraudSignals> } {
+    const parts: string[] = [];
+    let signals = mergeFraudSignals(undefined, "");
+    for (const row of this.sessions.recent(sessionId, 40)) {
+      if (row.role !== "user" || row.ts < sinceTs) continue;
+      parts.push(row.text);
+      signals = mergeFraudSignals(signals, row.text);
+    }
+    return { userText: parts.join("\n"), signals };
+  }
+
   /** 反诈评估(执行侧使用的最终评估) */
   private evaluateFraud(
     input: Record<string, unknown>,
@@ -12313,8 +12704,28 @@ function mergeFraudSignals(
   userText: string,
 ): { urgency: boolean; secrecy: boolean; guided: boolean; keywords: string[]; note?: string } {
   const URGENCY = ["马上", "赶紧", "立刻", "来不及", "急着", "抓紧", "限时", "否则"];
-  const SECRECY = ["不要告诉", "别告诉", "保密", "不能跟别人说", "别说出去", "只有您知道"];
-  const GUIDED = ["他让我", "他教我", "客服说", "对方说", "按他说的", "他叫我", "让我这么操作"];
+  const SECRECY = [
+    "不要告诉",
+    "别告诉",
+    "保密",
+    "不能告诉",
+    "不能跟别人说",
+    "不能跟任何人说",
+    "别说出去",
+    "只有您知道",
+  ];
+  const GUIDED = [
+    "他让我",
+    "他教我",
+    "教我操作",
+    "教您操作",
+    "客服说",
+    "对方说",
+    "按他说的",
+    "他叫我",
+    "让我这么操作",
+    "电话里教",
+  ];
 
   const ruleUrgency = URGENCY.some((k) => userText.includes(k));
   const ruleSecrecy = SECRECY.some((k) => userText.includes(k));
@@ -13647,6 +14058,7 @@ export function toPendingActionView(pending: {
   input: Record<string, unknown>;
   createdAt?: number;
   expiresAt?: number;
+  policyReasons?: PolicyReason[];
 }): {
   pendingId: string;
   capability: string;
@@ -13654,6 +14066,7 @@ export function toPendingActionView(pending: {
   payloadHash: string;
   summary: string;
   frozenPayload: Record<string, unknown>;
+  risk: ReturnType<typeof buildRiskView>;
 } {
   return {
     pendingId: pending.pendingId,
@@ -13662,6 +14075,8 @@ export function toPendingActionView(pending: {
     payloadHash: pending.payloadHash,
     summary: describePendingAction({ capability: pending.capability, input: pending.input }),
     frozenPayload: stripPrivateFields(pending.input),
+    // 三段刻度盘的数据:分数/阈值/因子全部由服务端给,界面只负责画
+    risk: buildRiskView(pending.policyReasons, pending.requiredTier as Tier),
   };
 }
 

@@ -181,8 +181,100 @@ function addMessage({ role, text, variant, stack }) {
   }
 
   messagesEl.appendChild(wrap);
-  scrollToEnd();
+  if (role === "agent") makeCollapsible(wrap);
+  scrollMsgToStart(wrap);
   return wrap;
+}
+
+/**
+ * 长回复默认收起:先读到结论,细节想看再展开。
+ * 只折叠展示高度,一个字都不删 —— 需要核对全文的人随时能打开。
+ */
+function makeCollapsible(wrap) {
+  const stack = wrap.querySelector(".stack");
+  const hasRich = Boolean(stack?.querySelector(".lr, .bill-chart, .ui-card, .visual, .quiz-step"));
+  for (const bubble of wrap.querySelectorAll(".bubble")) {
+    const text = bubble.textContent ?? "";
+    const blocks = bubble.querySelectorAll("p, br, li").length;
+    const minLen = hasRich ? 72 : 280;
+    const minBlocks = hasRich ? 4 : 8;
+    if (text.length < minLen && blocks < minBlocks) continue;
+    bubble.classList.add("is-collapsible", "is-collapsed");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "bubble-more";
+    btn.textContent = "展开全文";
+    btn.setAttribute("aria-expanded", "false");
+    btn.addEventListener("click", () => {
+      const collapsed = bubble.classList.toggle("is-collapsed");
+      btn.textContent = collapsed ? "展开全文" : "收起";
+      btn.setAttribute("aria-expanded", String(!collapsed));
+    });
+    bubble.after(btn); // 放在气泡外:折叠时按钮自己不能被遮罩盖住
+  }
+}
+
+/**
+ * 反诈警示卡。
+ *
+ * 数据是服务端反诈模块给出的结构化块(headline / scriptBreaker / 核实清单),
+ * 前端只做视觉强调 —— 提醒该不该出现、说什么,都不在这里决定。
+ * 之所以从正文里抽出来单独画:防骗信息混在长段文字里,恰好是最容易被滑过去的那种。
+ */
+function renderFraudNotice(fraud) {
+  if (!fraud) return null;
+  const questions = fraud.questions ?? [];
+  if (!fraud.headline && !fraud.scriptBreaker && questions.length === 0) return null;
+
+  const box = document.createElement("div");
+  box.className = "fraud";
+  box.setAttribute("role", "alert"); // 警示应当被辅助技术优先读到
+
+  const head = document.createElement("div");
+  head.className = "fraud-head";
+  head.innerHTML = '<i class="ri-alarm-warning-line" aria-hidden="true"></i>防骗提醒';
+  box.appendChild(head);
+
+  if (fraud.headline) {
+    const h = document.createElement("div");
+    h.className = "fraud-headline";
+    h.textContent = fraud.headline;
+    box.appendChild(h);
+  }
+  if (fraud.scriptBreaker) {
+    const s = document.createElement("div");
+    s.className = "fraud-break";
+    s.innerHTML = '<i class="ri-double-quotes-l" aria-hidden="true"></i>';
+    s.appendChild(document.createTextNode(fraud.scriptBreaker));
+    box.appendChild(s);
+  }
+  if (questions.length > 0) {
+    const cap = document.createElement("div");
+    cap.className = "fraud-cap";
+    cap.textContent = "转账前请先核实:";
+    box.appendChild(cap);
+    const ul = document.createElement("ul");
+    ul.className = "fraud-questions";
+    for (const q of questions) {
+      const li = document.createElement("li");
+      li.textContent = q;
+      ul.appendChild(li);
+    }
+    box.appendChild(ul);
+  }
+  if (fraud.coolDownSeconds > 0) {
+    const c = document.createElement("div");
+    c.className = "fraud-cool";
+    c.innerHTML = `<i class="ri-timer-line" aria-hidden="true"></i>请花 ${fraud.coolDownSeconds} 秒核实对方身份,再决定是否继续。`;
+    box.appendChild(c);
+  }
+  if (fraud.offerHumanSupport) {
+    const f = document.createElement("div");
+    f.className = "fraud-foot";
+    f.innerHTML = '<i class="ri-customer-service-2-line" aria-hidden="true"></i>无法确认对方身份时,可联系我行反诈专员协助核实。';
+    box.appendChild(f);
+  }
+  return box;
 }
 
 function renderCard(card) {
@@ -227,29 +319,164 @@ function renderCard(card) {
   return box;
 }
 
-function renderPolicy(summary) {
-  const items = (summary ?? []).filter((r) => r.effect === "deny" || r.effect === "escalate");
-  if (items.length === 0) return null;
+/**
+ * 裁决理由里只有「拒绝 / 需要升级介入」才值得摆到界面上。
+ * 放行类理由(白名单、信任抵扣等)由风险因子那一段去讲,不在这里重复一遍。
+ */
+function policyDecisionReasons(summary) {
+  return (summary ?? []).filter((r) => r.effect === "deny" || r.effect === "escalate");
+}
 
-  const details = document.createElement("details");
-  details.className = "policy";
-  const summaryEl = document.createElement("summary");
-  summaryEl.textContent = `策略裁决明细(${items.length} 条 · 纯确定性规则,无 LLM 参与)`;
-  details.appendChild(summaryEl);
+// ============================================================================
+// 渲染:风险刻度盘(三段)
+//
+// ★ 分数、阈值、因子、档位全部来自 turn.risk / pending.risk,由服务端组装。
+//   前端不做"多少分算高风险"的判断 —— 刻度线画在哪由 thresholds 决定,
+//   指针停在哪由 score 决定,这里只有「把给定区间按比例画出来」这一件事。
+// ============================================================================
 
-  const list = document.createElement("div");
-  list.className = "policy-list";
-  for (const r of items) {
-    const item = document.createElement("div");
-    item.className = `policy-item ${r.effect ?? ""}`;
-    const rid = document.createElement("span");
-    rid.className = "rid";
-    rid.textContent = `[${r.ruleId}] `;
-    item.append(rid, document.createTextNode(r.message ?? ""));
-    list.appendChild(item);
+/** 档位枚举 → 人话与配色(与 LANE_TEXT 同类:翻译,不是判断) */
+const RISK_TIER_TEXT = {
+  auto: { label: "低风险", cls: "ok", note: "这类操作可以直接办理" },
+  confirm: { label: "中风险", cls: "warn", note: "需要您确认后才会执行" },
+  strong_auth: { label: "高风险", cls: "danger", note: "需要您本人完成验证后才会执行" },
+  blocked: { label: "已拦截", cls: "danger", note: "这一步不能代办" },
+};
+
+function renderDecisionPanel(risk, policySummary) {
+  const reasons = policyDecisionReasons(policySummary);
+  const autoAt = Number(risk?.thresholds?.auto);
+  const confirmAt = Number(risk?.thresholds?.confirm);
+  const scaleOk =
+    typeof risk?.score === "number" && Number.isFinite(autoAt) && Number.isFinite(confirmAt) && confirmAt > autoAt;
+  const factors = Array.isArray(risk?.factors) ? risk.factors : [];
+  // 没有评分(只读能力)时,条款仍要出得来 —— 例如这一步被直接拒绝
+  if (!scaleOk && reasons.length === 0) return null;
+
+  const box = document.createElement("div");
+  box.className = "risk";
+
+  if (scaleOk) {
+    const score = Math.max(0, Math.min(100, risk.score));
+    const tier = RISK_TIER_TEXT[risk.tier] ?? RISK_TIER_TEXT.confirm;
+    box.classList.add(`risk-${tier.cls}`);
+
+    const top = document.createElement("div");
+    top.className = "risk-top";
+    const name = document.createElement("span");
+    name.className = "risk-name";
+    name.innerHTML = '<i class="ri-speed-up-line" aria-hidden="true"></i>风险评分';
+    const value = document.createElement("span");
+    value.className = "risk-value";
+    value.textContent = score.toFixed(1);
+    const tag = document.createElement("span");
+    tag.className = `risk-tag ${tier.cls}`;
+    tag.textContent = tier.label;
+    top.append(name, value, tag);
+    box.appendChild(top);
+
+    // 三段条:宽度完全由 thresholds 推出,阈值改了三段自然跟着变
+    const bar = document.createElement("div");
+    bar.className = "risk-bar";
+    for (const [cls, width] of [
+      ["ok", autoAt],
+      ["warn", confirmAt - autoAt],
+      ["danger", 100 - confirmAt],
+    ]) {
+      const seg = document.createElement("span");
+      seg.className = `risk-seg ${cls}`;
+      seg.style.width = `${width}%`;
+      bar.appendChild(seg);
+    }
+    const needle = document.createElement("span");
+    needle.className = "risk-needle";
+    needle.style.left = `${score}%`;
+    needle.setAttribute("aria-hidden", "true");
+    bar.appendChild(needle);
+    box.appendChild(bar);
+
+    const scale = document.createElement("div");
+    scale.className = "risk-scale";
+    for (const m of [
+      { at: 0, text: "0" },
+      { at: autoAt, text: String(autoAt) },
+      { at: confirmAt, text: String(confirmAt) },
+      { at: 100, text: "100" },
+    ]) {
+      const s = document.createElement("span");
+      s.style.left = `${m.at}%`;
+      s.textContent = m.text;
+      scale.appendChild(s);
+    }
+    box.appendChild(scale);
+
+    const verdict = document.createElement("div");
+    verdict.className = "risk-verdict";
+    verdict.textContent = tier.note;
+    box.appendChild(verdict);
   }
-  details.appendChild(list);
-  return details;
+
+  /**
+   * 展开区:这一分是怎么来的(因子)+ 命中了哪些条款(规则)。
+   * 默认折叠 —— 第一层只给结论,第二层才给证据,ruleId 这类工程信息收在这里。
+   */
+  if (factors.length > 0 || reasons.length > 0) {
+    const det = document.createElement("details");
+    det.className = "risk-factors";
+    const sum = document.createElement("summary");
+    const parts = [];
+    if (factors.length > 0) parts.push(`${factors.length} 项风险因子`);
+    if (reasons.length > 0) parts.push(`${reasons.length} 条规则条款`);
+    sum.textContent = `${scaleOk ? "为什么需要您介入" : "裁决依据"}(${parts.join(" · ")})`;
+    det.appendChild(sum);
+
+    if (factors.length > 0) {
+      const list = document.createElement("div");
+      list.className = "risk-factor-list";
+      for (const f of factors) {
+        const row = document.createElement("div");
+        row.className = "risk-factor";
+        const fn = document.createElement("span");
+        fn.className = "risk-factor-name";
+        fn.textContent = f.detail ? `${f.name}:${f.detail}` : String(f.name ?? "");
+        const fc = document.createElement("span");
+        const c = Number(f.contribution) || 0;
+        fc.className = `risk-factor-c ${c > 0 ? "up" : c < 0 ? "down" : ""}`;
+        fc.textContent = `${c > 0 ? "+" : ""}${c.toFixed(1)}`;
+        row.append(fn, fc);
+        list.appendChild(row);
+      }
+      det.appendChild(list);
+    }
+
+    if (reasons.length > 0) {
+      const head = document.createElement("div");
+      head.className = "risk-rules-head";
+      head.textContent = "命中的规则条款";
+      det.appendChild(head);
+      const list = document.createElement("div");
+      list.className = "risk-rules";
+      for (const r of reasons) {
+        const item = document.createElement("div");
+        item.className = `risk-rule ${r.effect ?? ""}`;
+        const rid = document.createElement("span");
+        rid.className = "rid";
+        rid.textContent = `[${r.ruleId}] `;
+        item.append(rid, document.createTextNode(r.message ?? ""));
+        list.appendChild(item);
+      }
+      det.appendChild(list);
+    }
+
+    // 口径说明放在最底层:是给人看的注释,不该占据标题
+    const note = document.createElement("div");
+    note.className = "risk-note";
+    note.textContent = "以上分数与条款均由确定性规则引擎计算,无 LLM 参与;可在审计面板按 trace 逐条核对。";
+    det.appendChild(note);
+    box.appendChild(det);
+  }
+
+  return box;
 }
 
 // ============================================================================
@@ -362,7 +589,8 @@ function renderFlow(flow, turn) {
   const box = document.createElement("details");
   box.className = "flow-card";
   const pendingNow = Boolean(turn?.promptFor?.kind && turn.promptFor.kind !== "none");
-  if (pendingNow) box.open = true;
+  const canSaveFlow = Boolean(flow.saveable && flow.template);
+  if (pendingNow || canSaveFlow) box.open = true;
 
   const head = document.createElement("summary");
   head.className = "flow-head";
@@ -396,6 +624,11 @@ function renderFlow(flow, turn) {
    *   (若让前端把模板内容拼好发上去,常用流程就成了一条绕过服务端的写入口。)
    */
   if (flow.saveable && flow.template) {
+    const lead = document.createElement("div");
+    lead.className = "flow-summary flow-save-lead";
+    lead.textContent = "这笔可以存为常用流程,下次少打字 —— 保存后在左上角抽屉「我的常用流程」里。";
+    box.appendChild(lead);
+
     const save = document.createElement("button");
     save.type = "button";
     save.className = "flow-save";
@@ -417,6 +650,7 @@ function renderFlow(flow, turn) {
         save.className = "flow-save saved";
         save.textContent = "已存入常用服务";
         noteSaved(r.flow);
+        void refreshDesk();
       } catch (err) {
         save.disabled = false;
         save.textContent = "存为常用流程";
@@ -424,11 +658,6 @@ function renderFlow(flow, turn) {
       }
     });
     box.appendChild(save);
-  } else if (flow.template && !flow.saveable) {
-    const hint = document.createElement("div");
-    hint.className = "flow-summary";
-    hint.textContent = "这一步办成后会自动进「常用服务」,下次点一下就办。";
-    box.appendChild(hint);
   }
 
   return box;
@@ -506,15 +735,49 @@ function renderCitations(citations) {
 // ============================================================================
 
 function renderSuggestions(suggestions) {
-  const items = (suggestions ?? []).slice(0, 3);
-  if (items.length === 0) return null;
+  const all = suggestions ?? [];
+  const planSteps = all
+    .filter((s) => s.ruleId === "EVENT-PLAN-STEP" || s.ruleId === "BRIEF-NEXT-STEP")
+    .slice(0, 3);
+  const items = all.filter((s) => s.ruleId !== "EVENT-PLAN-STEP" && s.ruleId !== "BRIEF-NEXT-STEP").slice(0, 3);
+  if (planSteps.length === 0 && items.length === 0) return null;
 
-  const box = document.createElement("div");
-  box.className = "suggest";
+  const wrap = document.createElement("div");
+  wrap.className = "suggest-wrap";
+
+  if (planSteps.length > 0) {
+    const plan = document.createElement("div");
+    plan.className = "suggest suggest-plan";
+    const planTitle = document.createElement("div");
+    planTitle.className = "suggest-title";
+    planTitle.textContent =
+      planSteps[0]?.ruleId === "BRIEF-NEXT-STEP" ? "发薪清单 · 点这里继续" : "联动方案 · 点这里继续";
+    plan.appendChild(planTitle);
+    for (const s of planSteps) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "suggest-btn suggest-btn-plan";
+      const ico = document.createElement("i");
+      ico.className = "ri-route-line";
+      ico.setAttribute("aria-hidden", "true");
+      const text = document.createElement("span");
+      text.className = "suggest-text";
+      text.textContent = s.text;
+      b.append(ico, text);
+      b.addEventListener("click", () => submit(s.say));
+      plan.appendChild(b);
+    }
+    wrap.appendChild(plan);
+  }
+
+  if (items.length === 0) return wrap;
+
+  const inner = document.createElement("div");
+  inner.className = "suggest";
   const title = document.createElement("div");
   title.className = "suggest-title";
   title.textContent = "接下来如果您愿意";
-  box.appendChild(title);
+  inner.appendChild(title);
 
   for (const s of items) {
     const b = document.createElement("button");
@@ -528,7 +791,7 @@ function renderSuggestions(suggestions) {
     text.textContent = s.text;
     b.append(ico, text);
     b.addEventListener("click", () => submit(s.say));
-    box.appendChild(b);
+    inner.appendChild(b);
 
     /**
      * ★ 把"为什么现在提"也显示出来。
@@ -539,10 +802,11 @@ function renderSuggestions(suggestions) {
       const why = document.createElement("div");
       why.className = "suggest-why";
       why.textContent = `依据:${s.reason}`;
-      box.appendChild(why);
+      inner.appendChild(why);
     }
   }
-  return box;
+  wrap.appendChild(wrapStackFold(inner, `可选建议(${items.length})`));
+  return wrap;
 }
 
 // ============================================================================
@@ -618,6 +882,10 @@ function renderPendingCard(pending) {
   if (fp.memo) body.appendChild(row("备注", String(fp.memo)));
   if (fp.cardId) body.appendChild(row("涉及卡片", String(fp.cardId)));
   box.appendChild(body);
+
+  // 同一张待办卡的第二帧(被悬空待办挡住时补画):风险刻度盘同样挂上
+  const pendingRisk = renderDecisionPanel(pending.risk);
+  if (pendingRisk) box.appendChild(pendingRisk);
 
   const warn = document.createElement("div");
   warn.className = "ui-card-warn";
@@ -1272,16 +1540,12 @@ function renderBillChart(v) {
   if ((v.notes ?? []).length > 0) {
     const notes = document.createElement("div");
     notes.className = "chart-notes";
-    const label = document.createElement("div");
-    label.className = "chart-panel-title";
-    label.textContent = "数据说明";
-    notes.appendChild(label);
     for (const note of v.notes) {
       const line = document.createElement("p");
       line.textContent = note;
       notes.appendChild(line);
     }
-    box.appendChild(notes);
+    box.appendChild(wrapStackFold(notes, "数据说明"));
   }
   return box;
 }
@@ -1292,7 +1556,274 @@ function renderVisual(visual) {
   if (visual.kind === "review_plan") return renderReviewPlan(visual);
   if (visual.kind === "retraction") return renderRetraction(visual);
   if (visual.kind === "bill_chart") return renderBillChart(visual);
+  if (visual.kind === "anomaly_report") return renderAnomalyReport(visual);
+  if (visual.kind === "list_report") return renderListReport(visual);
+  if (visual.kind === "quiz_step") return renderQuizStep(visual);
   return null;
+}
+
+/**
+ * 通用清单卡:余额、流水、定期支出、定时任务、AA 记录、卡列表共用这一套。
+ * 前端只做排版与着色 —— 条目标题、数值、徽章、色调全部由能力侧给好。
+ */
+const LIST_REPORT_BADGE = {
+  auto: "只读",
+  confirm: "待确认",
+  strong_auth: "强验证",
+};
+const LIST_REPORT_TONE = {
+  auto: "ok",
+  confirm: "medium",
+  strong_auth: "high",
+};
+
+function listReportItemTone(it) {
+  if (["high", "medium", "low", "ok"].includes(it.tone)) return it.tone;
+  return LIST_REPORT_TONE[it.badge] ?? "plain";
+}
+
+function listReportItemBadge(it) {
+  return LIST_REPORT_BADGE[it.badge] ?? it.badge ?? "";
+}
+
+function renderListReport(v) {
+  const items = Array.isArray(v.items) ? v.items : [];
+  const box = document.createElement("div");
+  box.className =
+    v.title === "联动方案" || v.title === "发薪分配清单" ? "lr lr-event-plan visual" : "lr";
+
+  const head = document.createElement("div");
+  head.className = "lr-head";
+  head.innerHTML = '<i class="ri-list-check-3" aria-hidden="true"></i>';
+  head.appendChild(document.createTextNode(v.title ?? "明细"));
+  box.appendChild(head);
+
+  if (v.subtitle) {
+    const sub = document.createElement("div");
+    sub.className = "lr-sub";
+    sub.textContent = v.subtitle;
+    box.appendChild(sub);
+  }
+  if (v.summary) {
+    const sum = document.createElement("div");
+    sum.className = "lr-summary";
+    sum.textContent = v.summary;
+    box.appendChild(sum);
+  }
+
+  if (v.bars?.length) {
+    const chart = document.createElement("div");
+    chart.className = "lr-bars";
+    chart.appendChild(
+      chartRows({
+        title: "构成",
+        chart: "bars",
+        legend: ["金额"],
+        series: v.bars.map((b) => ({ label: b.label, value: b.value })),
+      }),
+    );
+    box.appendChild(chart);
+  }
+
+  const list = document.createElement("div");
+  list.className = "lr-list";
+  const visibleCap = 4;
+  const primaryItems = items.length > visibleCap ? items.slice(0, visibleCap) : items;
+  const extraItems = items.length > visibleCap ? items.slice(visibleCap) : [];
+  for (const it of primaryItems) {
+    const tone = listReportItemTone(it);
+    const row = document.createElement("div");
+    row.className = `lr-item ${tone}`;
+
+    const top = document.createElement("div");
+    top.className = "lr-item-top";
+    const title = document.createElement("span");
+    title.className = "lr-title";
+    title.textContent = it.title ?? "";
+    top.appendChild(title);
+    const badgeText = listReportItemBadge(it);
+    if (badgeText) {
+      const b = document.createElement("span");
+      b.className = `lr-badge ${tone}`;
+      b.textContent = badgeText;
+      top.appendChild(b);
+    }
+    if (it.value) {
+      const val = document.createElement("span");
+      val.className = "lr-value";
+      val.textContent = it.value;
+      top.appendChild(val);
+    }
+    row.appendChild(top);
+
+    for (const line of it.lines ?? []) {
+      const d = document.createElement("div");
+      d.className = "lr-line";
+      d.textContent = line;
+      row.appendChild(d);
+    }
+    list.appendChild(row);
+  }
+  box.appendChild(list);
+
+  if (extraItems.length > 0) {
+    const moreList = document.createElement("div");
+    moreList.className = "lr-list lr-list-more";
+    for (const it of extraItems) {
+      const tone = listReportItemTone(it);
+      const row = document.createElement("div");
+      row.className = `lr-item ${tone}`;
+      const top = document.createElement("div");
+      top.className = "lr-item-top";
+      const title = document.createElement("span");
+      title.className = "lr-title";
+      title.textContent = it.title ?? "";
+      top.appendChild(title);
+      const badgeText = listReportItemBadge(it);
+      if (badgeText) {
+        const b = document.createElement("span");
+        b.className = `lr-badge ${tone}`;
+        b.textContent = badgeText;
+        top.appendChild(b);
+      }
+      if (it.value) {
+        const val = document.createElement("span");
+        val.className = "lr-value";
+        val.textContent = it.value;
+        top.appendChild(val);
+      }
+      row.appendChild(top);
+      for (const line of it.lines ?? []) {
+        const d = document.createElement("div");
+        d.className = "lr-line";
+        d.textContent = line;
+        row.appendChild(d);
+      }
+      moreList.appendChild(row);
+    }
+    box.appendChild(wrapStackFold(moreList, `其余 ${extraItems.length} 条明细`));
+  }
+
+  if (v.footer) {
+    const f = document.createElement("div");
+    f.className = "lr-footer";
+    f.textContent = v.footer;
+    box.appendChild(wrapStackFold(f, "口径与提示"));
+  }
+  if (v.actions?.length) {
+    const actWrap = document.createElement("div");
+    actWrap.className = "lr-actions-head";
+    actWrap.textContent = "下一步(点选即发送)";
+    box.appendChild(actWrap);
+    box.appendChild(visualActions(v.actions));
+  }
+  return box;
+}
+
+function renderQuizStep(v) {
+  const box = document.createElement("div");
+  box.className = "visual quiz-step";
+
+  const head = document.createElement("div");
+  head.className = "v-head";
+  const title = document.createElement("div");
+  title.className = "v-title";
+  title.textContent = v.title ?? "问卷";
+  head.appendChild(title);
+  const prog = document.createElement("span");
+  prog.className = "quiz-progress";
+  prog.textContent = v.progress ?? "";
+  head.appendChild(prog);
+  box.appendChild(head);
+
+  const q = document.createElement("div");
+  q.className = "quiz-question";
+  q.textContent = v.question ?? "";
+  box.appendChild(q);
+
+  const opts = document.createElement("div");
+  opts.className = "quiz-options";
+  for (const o of v.options ?? []) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "quiz-opt";
+    b.textContent = o.label;
+    b.addEventListener("click", () => submit(o.say ?? o.optionId));
+    opts.appendChild(b);
+  }
+  box.appendChild(opts);
+  return box;
+}
+
+/**
+ * 异常交易清单卡:等级着色 + 依据 + 建议。
+ * 等级是检测能力给的 severity,这里只做「等级 → 颜色/图标」的展示映射。
+ */
+function renderAnomalyReport(v) {
+  const LEVEL = {
+    high: { cls: "high", label: "高", icon: "ri-error-warning-line" },
+    medium: { cls: "medium", label: "中", icon: "ri-alert-line" },
+    low: { cls: "low", label: "低", icon: "ri-information-line" },
+  };
+  const items = Array.isArray(v.items) ? v.items : [];
+  const box = document.createElement("div");
+  box.className = "anom";
+
+  const head = document.createElement("div");
+  head.className = "anom-head";
+  head.innerHTML = '<i class="ri-search-eye-line" aria-hidden="true"></i>异常交易检查';
+  box.appendChild(head);
+
+  const meta = document.createElement("div");
+  meta.className = "anom-meta";
+  meta.textContent = `${v.windowLabel ?? ""} · 检查了 ${v.checkedCount ?? 0} 笔支出`;
+  box.appendChild(meta);
+
+  if (v.summary) {
+    const sum = document.createElement("div");
+    sum.className = "anom-summary";
+    sum.textContent = v.summary;
+    box.appendChild(sum);
+  }
+
+  const list = document.createElement("div");
+  list.className = "anom-list";
+  for (const it of items) {
+    const lv = LEVEL[it.severity] ?? LEVEL.low;
+    const row = document.createElement("div");
+    row.className = `anom-item ${lv.cls}`;
+
+    const top = document.createElement("div");
+    top.className = "anom-item-top";
+    const badge = document.createElement("span");
+    badge.className = `anom-badge ${lv.cls}`;
+    badge.innerHTML = `<i class="${lv.icon}" aria-hidden="true"></i>${lv.label}`;
+    const title = document.createElement("span");
+    title.className = "anom-title";
+    title.textContent = it.title ?? "";
+    const date = document.createElement("span");
+    date.className = "anom-date";
+    date.textContent = it.dateLabel ?? "";
+    top.append(badge, title, date);
+    row.appendChild(top);
+
+    if (it.description) {
+      const d = document.createElement("div");
+      d.className = "anom-desc";
+      d.textContent = it.description;
+      row.appendChild(d);
+    }
+    if (it.advice) {
+      const a = document.createElement("div");
+      a.className = "anom-advice";
+      a.innerHTML = '<i class="ri-lightbulb-line" aria-hidden="true"></i>';
+      a.appendChild(document.createTextNode(it.advice));
+      row.appendChild(a);
+    }
+    list.appendChild(row);
+  }
+  box.appendChild(list);
+  return box;
 }
 
 // ============================================================================
@@ -1343,11 +1874,23 @@ function stripCardBlock(text, card) {
 
 function renderTurn(turn) {
   const card = renderCard(turn.card);
-  const policy = renderPolicy(turn.policySummary);
   const actions = renderActions(turn);
   const cites = renderCitations(turn.citations);
   const suggests = renderSuggestions(turn.suggestions);
   const visual = renderVisual(turn.visual);
+  // 裁决解释只有一个入口:分数、因子、命中条款都在这一块里
+  let decision = renderDecisionPanel(turn.risk, turn.policySummary);
+  const fraud = renderFraudNotice(turn.fraud);
+
+  const needsInteraction =
+    turn.promptFor?.kind === "confirm" ||
+    turn.promptFor?.kind === "strong_auth" ||
+    Boolean(card) ||
+    Boolean(actions);
+
+  if (decision && !needsInteraction) {
+    decision = wrapStackFold(decision, "风控与规则说明");
+  }
 
   // 先处理流程卡:同一线程的旧卡要原地退役(避免聊天记录里堆一串"进行中")
   let flow = null;
@@ -1365,7 +1908,7 @@ function renderTurn(turn) {
   }
 
   // 有结构化卡片时:文本与卡片放进同一个"堆栈",视觉上属于同一条回复
-  if (card || policy || actions || flow || cites || suggests || visual) {
+  if (card || decision || fraud || actions || flow || cites || suggests || visual) {
     const stack = document.createElement("div");
     stack.className = "stack";
     const bubble = document.createElement("div");
@@ -1375,6 +1918,10 @@ function renderTurn(turn) {
     // 可视块紧跟结论:它是这一轮最重要的信息
     if (visual) stack.appendChild(visual);
     if (card) stack.appendChild(card);
+    // 防骗警示紧跟交易信息、先于任何按钮:客户必须在点确认之前看到它
+    if (fraud) stack.appendChild(fraud);
+    // 裁决解释放在「看什么」与「点哪里」之间:先知道这笔有多大风险,再决定按不按确认
+    if (decision) stack.appendChild(decision);
     if (actions) stack.appendChild(actions);
     /**
      * ★ 顺序有意为之:先看他能做什么(卡片/按钮),再看他走到哪了(流程),
@@ -1384,13 +1931,13 @@ function renderTurn(turn) {
      */
     if (flow) stack.appendChild(flow);
     if (cites) stack.appendChild(cites);
-    if (policy) stack.appendChild(policy);
     if (suggests) stack.appendChild(suggests);
     addMessage({ role: "agent", stack });
   } else {
     const variant = turn.terminal?.kind === "denied" ? "denied" : undefined;
     const wrap = addMessage({ role: "agent", text: stripCardBlock(turn.reply, turn.card), variant });
-    if (policy) wrap.appendChild(policy);
+    if (fraud) wrap.appendChild(fraud);
+    if (decision) wrap.appendChild(decision);
   }
 
   pending = turn.promptFor?.kind && turn.promptFor.kind !== "none" ? turn.promptFor : null;
@@ -1423,7 +1970,8 @@ async function appendPendingCard() {
     stack.appendChild(card);
     wrap.append(av, stack);
     messagesEl.appendChild(wrap);
-    scrollToEnd();
+    makeCollapsible(wrap);
+    scrollMsgToStart(wrap);
   } catch {
     // 拉不到就算了 —— 这只是体验补强,不该反过来打断主流程
   }
@@ -1439,7 +1987,7 @@ function setThinking(on) {
       '<div class="avatar"><i class="ri-robot-2-line" aria-hidden="true"></i></div>' +
       '<div class="bubble"><div class="typing"><i></i><i></i><i></i></div></div>';
     messagesEl.appendChild(el);
-    scrollToEnd();
+    scrollMsgToStart(el);
   } else if (!on && el) {
     el.remove();
   }
@@ -1450,6 +1998,29 @@ function scrollToEnd() {
   requestAnimationFrame(() => {
     paneChat.scrollTop = paneChat.scrollHeight;
   });
+}
+
+/** 把新消息顶对齐到聊天区顶部附近,方便从回复开头往下读(不强制滚到底) */
+function scrollMsgToStart(wrap) {
+  const pane = paneChat;
+  if (!wrap || !pane) return;
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      const paneTop = pane.getBoundingClientRect().top;
+      const elTop = wrap.getBoundingClientRect().top;
+      pane.scrollTop += elTop - paneTop - 8;
+    });
+  });
+}
+
+function wrapStackFold(node, label) {
+  if (!node) return null;
+  const det = document.createElement("details");
+  det.className = "stack-fold";
+  const sum = document.createElement("summary");
+  sum.textContent = label;
+  det.append(sum, node);
+  return det;
 }
 
 // ============================================================================
@@ -1482,9 +2053,12 @@ formEl.addEventListener("submit", (e) => {
   submit(inputEl.value);
 });
 
-// 移动端键盘弹起时,把对话滚到底
+// 移动端键盘弹起时,把输入框上方最近一条消息顶对齐,避免整页被顶到最底
 inputEl.addEventListener("focus", () => {
-  setTimeout(scrollToEnd, 260);
+  setTimeout(() => {
+    const last = messagesEl.querySelector(".msg:last-of-type");
+    if (last) scrollMsgToStart(last);
+  }, 260);
 });
 
 // ============================================================================
@@ -1500,7 +2074,7 @@ const QUICK = [
   { icon: "ri-bar-chart-2-line", label: "账单分析", text: "上个月账单报告" },
   { icon: "ri-coins-line", label: "理财", text: "我的理财持仓收益" },
   { icon: "ri-bank-card-line", label: "我的卡片", text: "我有哪些卡?" },
-  { icon: "ri-alarm-warning-line", label: "挂失冻结", text: "卡丢了先挂失" },
+  { icon: "ri-alarm-warning-line", label: "挂失", text: "卡丢了先挂失" },
 ];
 const QUICK_MORE = [
   { icon: "ri-line-chart-line", label: "额度管理", text: "信用卡额度太低能不能提额" },
@@ -1676,21 +2250,14 @@ function renderDrawer() {
   }
 
   /**
-   * ★ 客户自己的常用流程:只展示**真的用过**的一两条。
+   * ★ 我的常用流程:最多两条,顺序跟服务端一致(最近保存或最近用过在前)。
    *
-   *   上一版是"办成一件事就自动记住",于是常用服务里堆了一串系统塞进来的条目 ——
-   *   客户的原话是"不要举例那么多,搞一两个我用过有次数在那就好"。
-   *   所以这里:
-   *     · 按使用次数排序,最多两条;
-   *     · 一条都没用过时,显示最近添加的那一条(否则客户刚存完却看不到,会以为没存上);
-   *     · 入口名里带"用过 N 次",客户一眼知道这是自己常用的,而不是系统推荐的。
+   *   不再固定只展示「useCount 最高的两条」—— 刚存的新流程 useCount 还是 0,
+   *   若抽屉里永远占着演示阶段用过的旧条目,客户会以为没存上。
+   *   `/api/personalization` 里的 flows 已按 lastUsedAt ?? createdAt 排好序。
    */
   const allFlows = profile?.personalization?.flows ?? [];
-  const usedFlows = allFlows
-    .filter((f) => (f.useCount ?? 0) > 0)
-    .sort((a, b) => (b.useCount ?? 0) - (a.useCount ?? 0))
-    .slice(0, 2);
-  const myFlows = usedFlows.length > 0 ? usedFlows : allFlows.slice(0, 1);
+  const myFlows = allFlows.slice(0, 2);
 
   if (myFlows.length > 0) {
     hero.appendChild(sectionTitle("我的常用流程"));
@@ -2232,6 +2799,9 @@ async function openAudit() {
 function closeAudit() {
   if (auditTimer) clearInterval(auditTimer);
   auditTimer = null;
+  // 下次进来永远从哈希链开始,并恢复轮询 —— 不要停在上一回看的某条 trace 上
+  auditMode = "chain";
+  auditTraceId = null;
   paneAudit.hidden = true;
   paneChat.hidden = false;
   composer.hidden = false;
@@ -2240,8 +2810,237 @@ function closeAudit() {
   scrollToEnd();
 }
 
+/**
+ * 审计面板的两种看法:
+ *   chain —— 区块浏览器:每条事件是一块,能展开看哈希与载荷,能顺着 prevHash 核对;
+ *   trace —— 全链路胶片:同一 traceId 的事件按发生顺序排成瀑布,看一次业务走了哪些环节。
+ * trace 是历史定格,不轮询;chain 保持 4 秒轮询(演示时能看到新块长出来)。
+ */
+let auditMode = "chain";
+let auditTraceId = null;
+/** 已展开的区块(seq)。轮询重绘后仍保持展开,不把用户正在看的那块合起来 */
+const openBlocks = new Set();
+
+/** 事件类型 → 人话。与 LANE_TEXT 同级:翻译枚举,不含任何业务判断。 */
+const AUDIT_EVENT_TEXT = {
+  envelope_received: "收到请求",
+  intent_parsed: "意图解析",
+  plan_created: "生成执行计划",
+  policy_evaluated: "策略裁决",
+  confirm_presented: "展示确认卡",
+  strong_auth_requested: "要求本人验证",
+  strong_auth_completed: "本人验证通过",
+  execution_started: "开始执行",
+  execution_completed: "执行完成",
+  handoff_to_human: "转人工审批",
+  compensation_started: "开始补偿",
+  compensation_completed: "补偿完成",
+};
+
+function auditEventLabel(type) {
+  return AUDIT_EVENT_TEXT[type] ?? type;
+}
+
+async function copyHash(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+    const old = btn.textContent;
+    btn.textContent = "已复制";
+    setTimeout(() => {
+      btn.textContent = old;
+    }, 1200);
+  } catch {
+    btn.textContent = "复制失败";
+  }
+}
+
+/** 一条哈希:等宽缩略 + 点击复制完整值(取证时要的是完整的 64 位) */
+function hashLine(label, full, short) {
+  const row = document.createElement("div");
+  row.className = "blk-hash-row";
+  const l = document.createElement("span");
+  l.className = "blk-hash-label";
+  l.textContent = label;
+  const v = document.createElement("code");
+  v.className = "blk-hash-val";
+  v.textContent = full || short || "—";
+  row.append(l, v);
+  if (full) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "blk-copy";
+    b.textContent = "复制";
+    b.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      void copyHash(full, b);
+    });
+    row.appendChild(b);
+  }
+  return row;
+}
+
+/** 单个区块:头部永远可见,哈希与载荷点开了才看 */
+function auditBlockEl(e) {
+  const det = document.createElement("details");
+  det.className = "blk";
+  if (e.sessionId === sessionId) det.classList.add("hl");
+  det.open = openBlocks.has(e.seq);
+  det.addEventListener("toggle", () => {
+    if (det.open) openBlocks.add(e.seq);
+    else openBlocks.delete(e.seq);
+  });
+
+  const sum = document.createElement("summary");
+  sum.className = "blk-head";
+  const seq = document.createElement("span");
+  seq.className = "blk-seq";
+  seq.textContent = `#${e.seq}`;
+  const type = document.createElement("span");
+  type.className = "blk-type";
+  type.textContent = auditEventLabel(e.type);
+  const time = document.createElement("span");
+  time.className = "blk-time";
+  time.textContent = new Date(e.ts).toLocaleTimeString("zh-CN");
+  sum.append(seq, type, time);
+  det.appendChild(sum);
+
+  const body = document.createElement("div");
+  body.className = "blk-body";
+  body.appendChild(hashLine("本块哈希", e.hash, e.hashShort));
+  body.appendChild(hashLine("前块哈希", e.prevHash, e.prevHashShort));
+
+  const meta = document.createElement("div");
+  meta.className = "blk-meta";
+  meta.textContent = `${e.type} · ${e.channel ?? "-"} · ${new Date(e.ts).toLocaleString("zh-CN")}`;
+  body.appendChild(meta);
+
+  const openTraceBtn = document.createElement("button");
+  openTraceBtn.type = "button";
+  openTraceBtn.className = "blk-trace-btn";
+  openTraceBtn.innerHTML = '<i class="ri-node-tree" aria-hidden="true"></i>看这次业务的全链路';
+  openTraceBtn.addEventListener("click", () => void openTrace(e.traceId));
+  body.appendChild(openTraceBtn);
+
+  const pre = document.createElement("pre");
+  pre.className = "blk-payload";
+  pre.textContent = JSON.stringify(e.payload ?? {}, null, 2);
+  body.appendChild(pre);
+
+  det.appendChild(body);
+  return det;
+}
+
+/**
+ * 全链路瀑布:同一 traceId 下真实发生过的事件,按时间顺序排开。
+ *
+ * ★ 与流程卡的关系:流程卡是「给客户看的人话」,这里是「给评委/审计看的原始证据」。
+ *   两者读的是同一条链,所以不存在界面一套、审计一套的问题。
+ */
+function traceWaterfall(events) {
+  const wrap = document.createElement("div");
+  wrap.className = "wf";
+  const rows = [...events].sort((a, b) => a.ts - b.ts || a.seq - b.seq);
+  const t0 = rows[0]?.ts ?? 0;
+  const tEnd = rows[rows.length - 1]?.ts ?? t0;
+  const span = Math.max(1, tEnd - t0);
+
+  for (const e of rows) {
+    const row = document.createElement("details");
+    row.className = "wf-row";
+
+    const sum = document.createElement("summary");
+    sum.className = "wf-head";
+
+    const offset = document.createElement("span");
+    offset.className = "wf-offset";
+    offset.textContent = `+${e.ts - t0}ms`;
+
+    const rail = document.createElement("span");
+    rail.className = "wf-rail";
+    const dot = document.createElement("span");
+    dot.className = "wf-dot";
+    rail.appendChild(dot);
+
+    const label = document.createElement("span");
+    label.className = "wf-label";
+    label.textContent = auditEventLabel(e.type);
+
+    // 位置条:这个事件在本次业务的时间轴上发生在哪 —— 一眼看出哪一段最耗时
+    const bar = document.createElement("span");
+    bar.className = "wf-bar";
+    const fill = document.createElement("span");
+    fill.style.left = `${((e.ts - t0) / span) * 100}%`;
+    bar.appendChild(fill);
+
+    sum.append(offset, rail, label, bar);
+    row.appendChild(sum);
+
+    const body = document.createElement("div");
+    body.className = "wf-body";
+    const seq = document.createElement("div");
+    seq.className = "blk-meta";
+    seq.textContent = `#${e.seq} · ${e.type} · ${new Date(e.ts).toLocaleTimeString("zh-CN")}`;
+    body.appendChild(seq);
+    const pre = document.createElement("pre");
+    pre.className = "blk-payload";
+    pre.textContent = JSON.stringify(e.payload ?? {}, null, 2);
+    body.appendChild(pre);
+    row.appendChild(body);
+
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
+async function openTrace(traceId) {
+  if (!traceId) return;
+  auditMode = "trace";
+  auditTraceId = traceId;
+  // 历史定格,不轮询 —— 否则每 4 秒重绘会把用户展开的 payload 合起来
+  if (auditTimer) clearInterval(auditTimer);
+  auditTimer = null;
+  appbarSub.textContent = "全链路证据";
+  await refreshAudit();
+}
+
+function backToChain() {
+  auditMode = "chain";
+  auditTraceId = null;
+  appbarSub.textContent = "审计与安全";
+  void refreshAudit();
+  if (!auditTimer) auditTimer = setInterval(refreshAudit, 4000);
+}
+
 async function refreshAudit() {
   try {
+    if (auditMode === "trace" && auditTraceId) {
+      const data = await get(`/api/audit/recent?traceId=${encodeURIComponent(auditTraceId)}&limit=200`);
+      const events = data.events ?? [];
+      auditBody.innerHTML = "";
+
+      const back = document.createElement("button");
+      back.type = "button";
+      back.className = "wf-back";
+      back.innerHTML = '<i class="ri-arrow-left-s-line" aria-hidden="true"></i>返回哈希链';
+      back.addEventListener("click", backToChain);
+      auditBody.appendChild(back);
+
+      const hero = document.createElement("div");
+      hero.className = "audit-hero";
+      const title = document.createElement("div");
+      title.textContent = "一次业务的全过程";
+      const meta = document.createElement("div");
+      meta.className = "audit-meta";
+      const ts = events.map((e) => e.ts);
+      const span = ts.length > 1 ? Math.max(...ts) - Math.min(...ts) : 0;
+      meta.textContent = `${events.length} 个事件 · 跨度 ${span}ms · ${auditTraceId}`;
+      hero.append(title, meta);
+      auditBody.appendChild(hero);
+
+      auditBody.appendChild(traceWaterfall(events));
+      return;
+    }
+
     const [verify, recent] = await Promise.all([
       get("/api/audit/verify"),
       get("/api/audit/recent?limit=40"),
@@ -2258,7 +3057,7 @@ async function refreshAudit() {
     meta.className = "audit-meta";
     meta.textContent =
       `事件总数 ${verify.total} · 每条哈希 = SHA256(seq|ts|type|payload|prevHash)。` +
-      "任何一条被修改、删除或插入,后续全链校验都会失败并精确定位断点。";
+      "点开任意一块可复制完整哈希、核对前块链接,或看这次业务的全链路。";
     hero.append(title, meta);
     auditBody.appendChild(hero);
 
@@ -2266,27 +3065,10 @@ async function refreshAudit() {
     list.className = "audit-list";
     const events = [...(recent.events ?? [])].reverse();
     for (const e of events) {
-      const ev = document.createElement("div");
-      ev.className = "audit-ev";
-      if (e.sessionId === sessionId) ev.classList.add("hl");
-
-      const top = document.createElement("div");
-      top.className = "audit-ev-top";
-      const type = document.createElement("span");
-      type.className = "audit-ev-type";
-      type.textContent = e.type;
-      const seq = document.createElement("span");
-      seq.className = "audit-ev-seq";
-      seq.textContent = `#${e.seq} · ${new Date(e.ts).toLocaleTimeString("zh-CN")}`;
-      top.append(type, seq);
-      ev.appendChild(top);
-
-      const hash = document.createElement("div");
-      hash.className = "audit-ev-hash";
-      hash.textContent = `${e.hashShort} ← ${e.prevHashShort}`;
-      ev.appendChild(hash);
-
-      list.appendChild(ev);
+      const blk = auditBlockEl(e);
+      // 校验已定位到断点:把那块标出来,而不是只在一行文字里报个序号
+      if (!verify.intact && e.seq === verify.brokenAtSeq) blk.classList.add("broken");
+      list.appendChild(blk);
     }
     auditBody.appendChild(list);
   } catch (err) {

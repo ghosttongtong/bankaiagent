@@ -43,6 +43,7 @@ const CAPABILITY_LABELS: Record<string, string> = {
   "account.detect_recurring": "定期支出识别",
   "account.cashflow": "收支分析",
   "account.insights": "账单洞察",
+  "account.payday_brief": "发薪分配清单",
   "account.health_label": "财务健康标签",
   "account.budget_plan": "预算规划",
   "account.analyze_spending": "消费分析",
@@ -60,7 +61,7 @@ const CAPABILITY_LABELS: Record<string, string> = {
   // ---- 卡片 ----
   "card.list": "我的卡片",
   "card.detail": "卡片详情",
-  "card.report_loss": "挂失冻结",
+  "card.report_loss": "挂失",
   "card.replace": "补卡",
   "card.activate": "激活新卡",
   "card.new_application": "信用卡申请",

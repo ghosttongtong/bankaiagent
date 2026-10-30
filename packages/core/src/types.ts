@@ -2394,6 +2394,8 @@ export interface AgentTurnResult {
   reply: string;
   /** 富卡片(渠道不支持时降级为文本) */
   card?: ConfirmCard;
+  /** 反诈提醒块(标题 / 反话术提示 / 核实清单);有富卡片能力的渠道据此画警示卡 */
+  fraud?: import("./security/antiFraud.ts").FraudCardBlock;
   /** 需要用户做的动作 */
   promptFor?: {
     kind: "confirm" | "strong_auth" | "clarify" | "none";

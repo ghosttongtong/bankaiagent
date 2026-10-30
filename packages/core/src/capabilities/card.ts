@@ -79,7 +79,7 @@ export const CARD_KIND_LABELS: Record<CardKind, string> = {
 
 export const CARD_STATUS_LABELS: Record<CardStatus, string> = {
   active: "正常",
-  lost: "已挂失(已冻结)",
+  lost: "已挂失",
   frozen: "已冻结(银行/司法侧)",
   pending_activation: "未激活",
   replacement_in_transit: "补卡在途",

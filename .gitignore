@@ -26,3 +26,26 @@ Thumbs.db
 npm-debug.log*
 pnpm-debug.log*
 tmp/
+
+# 附加文档 —— 设计稿、图表、PPT 等仅本地参考,不进仓库
+docs/
+*.pptx
+tools/build-*.py
+
+# 非核心 CLI 工具(demo 脚本保留在磁盘,本地可跑,不上传)
+packages/cli/src/demo.ts
+packages/cli/src/diagnoseLlm.ts
+packages/cli/src/labelOutcomes.ts
+packages/cli/src/probeCapabilities.ts
+packages/cli/src/scorerReport.ts
+packages/cli/src/trainScorer.ts
+packages/cli/src/verifyAudit.ts
+
+# 非核心辅助脚本
+tools/cleanup-var.mjs
+tools/verify-extras.mjs
+tools/verify-gateway-extras.mjs
+tools/verify-sessions.mjs
+
+# 本地配置(如有)
+.npmrc

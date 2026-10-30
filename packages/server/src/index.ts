@@ -44,6 +44,7 @@ import { fileURLToPath } from "node:url";
 
 import type { AuditEvent, CancellationState, Channel, MessageEnvelope } from "../../core/src/index.ts";
 import { toPendingActionView } from "../../core/src/agent/orchestrator.ts";
+import { buildRiskView } from "../../core/src/policy/engine.ts";
 import { flowFamilyOf } from "../../core/src/agent/flowTrace.ts";
 import { OPERATION_STATUS_TONE } from "../../core/src/agent/operationStatus.ts";
 import { fmtYuan } from "../../core/src/util/format.ts";
@@ -875,6 +876,7 @@ async function handleRequest(
               requiredTier: pending.requiredTier,
               payloadHash: pending.payloadHash,
               input: pending.input,
+              policyReasons: pending.policyReasons,
             }),
             sessionId: pending.sessionId,
             createdAt: pending.createdAt,
@@ -1500,15 +1502,166 @@ async function serveStatic(res: ServerResponse, path: string): Promise<boolean> 
 // 视图转换
 // ============================================================================
 
+/**
+ * 面向「有按钮、有卡片」的终端整理回复文本。
+ *
+ * ★ 为什么在这里改,而不是改 replyComposer:
+ *   composer 产出的是**渠道无关**的完整文本,CLI 演示与 IM 渠道确实需要
+ *   「回复『确认』执行」这种指引 —— 那里没有按钮可点。
+ *   而 Web 界面上同一句话就是噪音:按钮就在卡片下面,文字却还在教用户打字。
+ *   所以按终端能力在**视图层**做最后一次呈现适配,业务结论一个字不动。
+ *
+ * 做两件事:
+ *   1. 有动作按钮时,删掉「回复『确认』/『取消』/『验证』/『转人工』」这类打字指引;
+ *   2. 反诈块由结构化警示卡呈现时,把等价的文字行从正文撤下,避免同一件事说两遍。
+ *      剔除用的是 fraud 块里的**原文精确匹配**,不是关键词猜测 —— 不会误伤别的句子。
+ */
+function adaptReplyForRichChannel(
+  reply: string,
+  opts: {
+    hasActions: boolean;
+    /** 本轮已有结构化清单卡(如异常交易),正文里那份纯文字条目就是重复 */
+    hasStructuredList?: boolean;
+    /** 已有卡片/图表时,正文只保留前几行结论(完整文本仍给 CLI) */
+    trimLongBody?: boolean;
+    fraud?: {
+      headline?: string;
+      scriptBreaker?: string;
+      questions?: string[];
+      offerHumanSupport?: boolean;
+    } | null;
+  },
+): { text: string; directives: string[] } {
+  let lines = reply.split("\n");
+
+  if (opts.trimLongBody && lines.length > 8) {
+    const kept = lines.slice(0, 4).filter((l) => l.trim().length > 0);
+    kept.push("明细见上方卡片。");
+    lines = kept;
+  }
+
+  const fraud = opts.fraud;
+  if (fraud) {
+    const drop = new Set<string>(["请先核实以下问题:"]);
+    if (fraud.headline) drop.add(fraud.headline);
+    if (fraud.scriptBreaker) drop.add(fraud.scriptBreaker);
+    for (const q of fraud.questions ?? []) drop.add(`· ${q}`);
+    if (fraud.offerHumanSupport) drop.add("如无法确认,请回复「转人工」,由反诈专员协助核实。");
+    lines = lines.filter((l) => !drop.has(l.trim()));
+  }
+
+  // 条目块:「[高] 标题 · 日期」起,后续缩进的依据与建议行都属于它。
+  // 裁的是已定格式的整块,不是按关键词猜句子。
+  if (opts.hasStructuredList) {
+    const kept: string[] = [];
+    let skipping = false;
+    for (const l of lines) {
+      if (/^\[(高|中|低)\]\s/.test(l.trim())) {
+        skipping = true;
+        continue;
+      }
+      if (skipping) {
+        if (l.trim().length === 0) continue;
+        if (/^\s/.test(l)) continue;
+        skipping = false;
+      }
+      kept.push(l);
+    }
+    lines = kept;
+  }
+
+  let removedHint = false;
+  if (opts.hasActions) {
+    lines = lines.filter((l) => {
+      const hit = /回复\s*[「"']?(确认|取消|验证|转人工)/.test(l) || l.trim() === "如何完成验证:";
+      if (hit) removedHint = true;
+      return !hit;
+    });
+  }
+
+  // 「回复「确认」」→ 有按钮时改成点按指引;追问/可选槽位仍保留可点 chip,但不假装有「备注」按钮。
+  const directives: string[] = [];
+  const chipWords = new Set([
+    "确认",
+    "确认转账",
+    "取消",
+    "验证",
+    "转人工",
+    "跳过",
+    "挂失",
+    "执行资金操作",
+    "帮我订花",
+    "帮我订门票",
+    "帮我订酒店",
+    "帮我订蛋糕",
+  ]);
+  lines = lines.map((l) =>
+    l.includes("回复")
+      ? l.replace(/回复「([^」]{1,12})」/g, (_whole, word: string) => {
+          if (chipWords.has(word)) {
+            if (!directives.includes(word)) directives.push(word);
+            return opts.hasActions ? `点下方「${word}」` : `点「${word}」或回复「${word}」`;
+          }
+          return _whole;
+        })
+      : l,
+  );
+
+  const text = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const hint = "核对无误后,点击下方按钮即可继续办理。";
+  if (removedHint) return { text: text ? `${text}\n\n${hint}` : hint, directives };
+  return { text, directives };
+}
+
 function toTurnView(
   result: Awaited<ReturnType<App["orchestrator"]["handleMessage"]>>,
   envelope: MessageEnvelope,
 ) {
+  const hasActions = result.promptFor?.kind === "confirm" || result.promptFor?.kind === "strong_auth";
+  const fraud = result.fraud ?? null;
+  // 清单卡带着自己的短正文:明细已在卡片里,正文只讲结论。CLI 仍走完整文本。
+  const visual = result.visual ?? null;
+  const compact =
+    visual && typeof visual === "object" && "compactBody" in visual && typeof visual.compactBody === "string"
+      ? visual.compactBody.trim() || null
+      : null;
+  const adapted = adaptReplyForRichChannel(compact ?? result.reply, {
+    hasActions,
+    fraud,
+    hasStructuredList: visual?.kind === "anomaly_report" || visual?.kind === "list_report",
+    trimLongBody: Boolean(visual) && !compact && !hasActions,
+  });
+  // 正文里出现的打字指令,同时给一颗可点的 chip —— 说的和点的必须是同一个词
+  const suggestions = [...(result.suggestions ?? [])];
+  /** 联动方案:visual 里的续办按钮同步成聊天区可点 chip(不少用户不会滚到清单卡底部) */
+  if (visual && typeof visual === "object" && visual.kind === "list_report" && Array.isArray(visual.actions)) {
+    const briefStep = visual.title === "发薪分配清单";
+    for (const a of visual.actions) {
+      if (!a?.say || !a?.label) continue;
+      if (suggestions.some((s) => s.say === a.say)) continue;
+      suggestions.unshift({
+        id: briefStep ? `payday-brief:${a.say}` : `event-plan:${a.say}`,
+        ruleId: briefStep ? "BRIEF-NEXT-STEP" : "EVENT-PLAN-STEP",
+        text: a.label,
+        say: a.say,
+        reason: briefStep ? "发薪清单里的建议续办,每项单独确认" : "来自刚生成的联动方案,只办其中一步",
+      } as (typeof suggestions)[number]);
+      if (suggestions.length >= 4) break;
+    }
+  }
+  for (const word of adapted.directives) {
+    if (suggestions.length >= 4) break;
+    if (suggestions.some((s) => s.say === word)) continue;
+    suggestions.push({ text: word, say: word } as (typeof suggestions)[number]);
+  }
   return {
     turnId: result.turnId,
     traceId: result.traceId,
     channel: envelope.channel,
-    reply: result.reply,
+    // 有按钮可点的终端,不再教用户「回复确认」;反诈内容交给下面的结构化警示卡
+    reply: adapted.text,
+    /** 反诈提醒:标题 / 反话术提示 / 需要客户核实的清单,由界面画成警示卡 */
+    fraud,
     card: result.card ?? null,
     promptFor: result.promptFor ?? null,
     terminal: result.terminal ?? null,
@@ -1529,9 +1682,20 @@ function toTurnView(
      */
     flow: result.flow ?? null,
     citations: result.citations ?? [],
-    suggestions: result.suggestions ?? [],
+    suggestions,
     /** ★ 可视块(材料比对 / 复核决策 / 误报撤回):界面按 kind 画,不做业务判断 */
-    visual: result.visual ?? null,
+    visual,
+    /**
+     * ★ 三段风险刻度盘 —— 只在「等你确认 / 等你验证」这一刻出现。
+     *
+     *   分数、分档阈值、各因子贡献全部由服务端从已落审计的裁决理由里组装,
+     *   前端不写死 28/62、也不认识 R-RISK-SCORE —— 否则等于把风控规则复制进界面层。
+     *   办结后不再下发:那一刻的叙事已由流程卡接手,档位停留在屏幕上只会误导。
+     */
+    risk:
+      result.promptFor?.kind === "confirm" || result.promptFor?.kind === "strong_auth"
+        ? buildRiskView(result.policySummary, result.promptFor.kind)
+        : null,
   };
 }
 
@@ -1539,6 +1703,7 @@ function toAuditView(e: {
   seq: number;
   ts: number;
   traceId: string;
+  sessionId: string;
   customerId: string;
   channel: string;
   type: string;
@@ -1550,11 +1715,15 @@ function toAuditView(e: {
     seq: e.seq,
     ts: e.ts,
     traceId: e.traceId,
+    sessionId: e.sessionId,
     channel: e.channel,
     type: e.type,
     payload: e.payload,
     hashShort: e.hash.slice(0, 12),
     prevHashShort: e.prevHash.slice(0, 12),
+    // 完整哈希:界面「区块浏览器」里用于逐块核对与复制取证;短哈希只够看,不够验
+    hash: e.hash,
+    prevHash: e.prevHash,
   };
 }
 

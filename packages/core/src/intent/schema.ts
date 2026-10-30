@@ -62,6 +62,8 @@ export const INTENT_ACTIONS = [
   "account.recurring", // 定期支出/订阅识别
   "account.cashflow", // 收支/现金流分析
   "account.insights", // 综合账单洞察
+  /** 发薪后分配清单(演示场景六替代):只读汇总 + 续办话术,不是跨场景联动方案 */
+  "account.payday_brief",
   "account.health_label", // 近几个月财务健康标签
   /**
    * ★ 预算规划(场景二的延伸)。
@@ -608,6 +610,12 @@ export const IntentSchema = z.object({
 
   /** 备注(会被净化后写入交易,注意:备注是注入载体) */
   memo: z.string().max(200).optional(),
+
+  /**
+   * 路由层:用户已在「要不要备注」追问里明确跳过。
+   * 仅用于避免出确认卡前反复问同一句;不会下发给能力或写入交易。
+   */
+  memoPromptSkipped: z.boolean().optional(),
 
   /** 付款账户引用(账户后四位或类型描述) */
   fromAccount: z

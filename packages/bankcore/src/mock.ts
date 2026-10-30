@@ -784,7 +784,8 @@ export function buildDemoWorld(options?: { now?: number; months?: number; seed?:
     bankName: "中国农业银行",
     isSelfOwned: false,
     isWhitelisted: false,
-    aliases: [],
+    // ★ 演示脚本(S6 第二幕)常用「陈志强」作涉诈名单收款人,与「王强」同一账户
+    aliases: ["陈志强"],
     successHistory: [],
     listFlag: {
       listType: "fraud",
@@ -792,6 +793,7 @@ export function buildDemoWorld(options?: { now?: number; months?: number; seed?:
       detail: "涉诈账户(公安部电信诈骗涉案账户名单)",
     },
   });
+  aliases.set(`${PRIMARY}:陈志强`, risky.payeeId);
 
   // 本人名下他行账户(演示"本人互转"低风险通道)
   const selfOtherBank = addPayee({
@@ -1314,6 +1316,30 @@ export function buildDemoWorld(options?: { now?: number; months?: number; seed?:
       sameDayDelivery: false,
       cancelPolicy: "入住前 3 天可免费取消;之后取消收取首晚房费。",
       rating: 4.6,
+    },
+    {
+      merchantId: "EXT-THEME-001",
+      name: "上海迪士尼度假区",
+      category: "theme_park",
+      categoryLabel: "主题乐园",
+      minAmount: 475,
+      hotItem: "标准票 1 日票(成人)",
+      bookAheadDays: 7,
+      sameDayDelivery: false,
+      cancelPolicy: "游玩日前 3 天(含)可免费改期一次;前 2 天起不可退,仅可按政策改期(以园区公告为准)。",
+      rating: 4.9,
+    },
+    {
+      merchantId: "EXT-THEME-002",
+      name: "长隆欢乐世界",
+      category: "theme_park",
+      categoryLabel: "主题乐园",
+      minAmount: 350,
+      hotItem: "一日通票(成人)",
+      bookAheadDays: 3,
+      sameDayDelivery: false,
+      cancelPolicy: "游玩日前 1 天 18:00 前可全额退;之后不可退,改期需联系园区客服。",
+      rating: 4.7,
     },
   ];
 

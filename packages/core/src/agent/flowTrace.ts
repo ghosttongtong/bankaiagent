@@ -31,11 +31,13 @@ import {
   type TemplateParam,
   type TurnExtras,
   type VisualBlock,
+  richCustomerReply,
 } from "./turnExtras.ts";
 import { approvalRuleFor, renderHandoffNotice, type ApprovalRule } from "./approval.ts";
 import { condenseForCustomer } from "./brevity.ts";
 import { capabilityLabel } from "./capabilityLabels.ts";
 import { fmtMoney } from "../util/format.ts";
+import { suggestSaveFlowNow } from "./suggestion.ts";
 
 // ============================================================================
 // 业务族(用于"常用流程"的识别与命名)
@@ -65,7 +67,7 @@ const FAMILIES: Record<string, FlowFamily> = {
   "wealth.risk_assess": { key: "wealth_assess", label: "风险测评", saveable: false },
   "wealth.rollover_plan": { key: "wealth_rollover_plan", label: "到期续接方案", saveable: false },
   "wealth.rollover_choose": { key: "wealth_rollover_choose", label: "登记续接选择", saveable: false },
-  "card.report_loss": { key: "card_loss", label: "挂失冻结", saveable: false },
+  "card.report_loss": { key: "card_loss", label: "挂失", saveable: false },
   "card.replace": { key: "card_replace", label: "补卡申请", saveable: true },
   "card.unblock": { key: "card_unblock", label: "解除限制申请", saveable: false },
   "card.limit_adjust": { key: "card_limit", label: "额度调整申请", saveable: false },
@@ -1496,14 +1498,25 @@ export function buildTurnDecoration(input: TurnDecorationInput): TurnDecoration 
   const citations = [...input.extras.citations];
   const richUi = input.extras.richUi;
 
+  // ★ 富渠道:明细已在 visual 卡片里,正文只留 compactBody(或图表/清单的一句话结论)
+  const replyForCustomer = richCustomerReply(input.extras, input.reply);
+
   // ★ 精简只用于富渠道:文字渠道的"元说明"往往同时承担解释职责,删了会更难懂
-  const condensed = richUi ? condenseForCustomer(input.reply) : { text: input.reply, removed: [] };
+  const condensed = richUi ? condenseForCustomer(replyForCustomer) : { text: input.reply, removed: [] };
+
+  let suggestions = [...input.suggestions];
+  if (flow?.saveable && input.extras.executedCapability) {
+    const family = flowFamilyOf(input.extras.executedCapability);
+    const nudge = suggestSaveFlowNow({ capability: input.extras.executedCapability, label: family.label });
+    const dup = suggestions.some((s) => s.ruleId === "SUG-SAVE-FLOW-NOW" || s.ruleId === "SUG-SAVE-AS-FLOW");
+    if (!dup) suggestions = [nudge, ...suggestions].slice(0, 3);
+  }
 
   const decorated = decorateTurn({
     reply: condensed.text,
     flow,
     citations,
-    suggestions: input.suggestions,
+    suggestions,
     promptKind: input.promptKind,
     richUi,
   });

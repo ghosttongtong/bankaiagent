@@ -71,10 +71,6 @@ export function renderConfirmReply(input: {
    *   去重放在**展示层**:界面渲染结构化卡片时,把文本里那段 `【标题】…` 折叠掉,
    *   于是客户不会看到两张一样的卡,但证据链一份不少。
    */
-  // 转账类操作才提示"可补备注";取消/催收等卡片不需要
-  const isTransferLike =
-    card != null && (card.title.includes("转账") || card.title.includes("汇款"));
-
   const lines: string[] = [];
 
   if (input.resolutionNote) {
@@ -148,9 +144,6 @@ export function renderConfirmReply(input: {
       );
     } else {
       lines.push("请确认以上信息。回复「确认」执行,回复「取消」放弃。");
-      if (isTransferLike && card != null && !card.fields.some((f) => f.label === "备注")) {
-        lines.push("如果要加备注,请回复「备注」及内容,例如「备注 生活费」。确认信息将重新出具。");
-      }
     }
   }
 
@@ -418,7 +411,12 @@ export function renderExecutionResult(input: {
   reference?: string;
 }): RenderedReply {
   if (!input.ok) {
-    const lines = [`操作未能完成:${input.errorMessage ?? failureReasonFromData(input.data) ?? "未知原因"}`];
+    const raw = input.errorMessage ?? failureReasonFromData(input.data) ?? "未知原因";
+    // ★ 取消不是失败。客户主动取消时,套上「操作未能完成 + 请调整后重试」反而说反了
+    if (raw.startsWith("已取消")) {
+      return { text: raw, promptFor: { kind: "none" } };
+    }
+    const lines = [`操作未能完成:${raw}`];
     lines.push("");
     lines.push("请调整后重试,或回复「转人工」由我行协助处理。");
     return { text: lines.join("\n"), promptFor: { kind: "none" } };

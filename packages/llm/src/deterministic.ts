@@ -83,8 +83,28 @@ export class DeterministicProvider implements LlmProvider {
 
 /** 受骗话术关键词库 */
 const FRAUD_URGENCY = ["马上", "赶紧", "立刻", "来不及", "急", "抓紧", "限时", "否则"];
-const FRAUD_SECRECY = ["不要告诉", "别告诉", "保密", "不能跟别人说", "别说出去", "只有你知道"];
-const FRAUD_GUIDED = ["他让我", "他教我", "客服说", "对方说", "按照他说的", "他叫我", "让我这么操作"];
+const FRAUD_SECRECY = [
+  "不要告诉",
+  "别告诉",
+  "保密",
+  "不能告诉",
+  "不能跟别人说",
+  "不能跟任何人说",
+  "别说出去",
+  "只有你知道",
+];
+const FRAUD_GUIDED = [
+  "他让我",
+  "他教我",
+  "教我操作",
+  "教您操作",
+  "客服说",
+  "对方说",
+  "按照他说的",
+  "他叫我",
+  "让我这么操作",
+  "电话里教",
+];
 const FRAUD_SCENE = [
   "安全账户",
   "资金清查",
@@ -352,7 +372,10 @@ function parseIntent(text: string, now: number): Intent {
   const namesInText = (text.match(/[\u4e00-\u9fa5]{2,4}(?:[、,和及][\u4e00-\u9fa5]{2,4})+/g) ?? []).length;
   const sharedCue = /(一起|共同|大家|我们|几个人|拼的|平摊|一人一半|均摊)/.test(text);
   const implicitCollection = namesInText >= 1 && sharedCue;
-  const isCollection = /(AA|aa|分摊|拼单|收款|让大家还|一起凑|均摊)/.test(text) || implicitCollection;
+  // ★ 口语里的单 A:「这顿饭600,跟他们A一下」「这单 A 钱」。
+  //   只写 AA|aa 时,这类句子会整句掉进转账分支,变成"给 A 转 600 元" —— 方向完全反了。
+  const isCollection =
+    /(AA|aa|[Aa]\s?一下|[Aa]钱|分摊|拼单|收款|让大家还|一起凑|均摊)/.test(text) || implicitCollection;
 
   // ---- 取消类:必须先区分"取消计划"与"撤销已转出的钱" ----
   // ★ 踩过的坑:用户说「取消定时转账」,早期只判断 /(撤销|撤回|取消那笔|退回)/,
@@ -375,8 +398,10 @@ function parseIntent(text: string, now: number): Intent {
   //   于是掉进转账分支被追问金额。
   //   这类问法在真实对话里极常见(垫付之后总会想知道钱回来没有)。
   const isCollectionStatus =
-    /(他们|大家|其他人|参与人|那几个人|别人)/.test(text) && /(付|给|还|转).{0,3}(钱|款|了)/.test(text)
-    || /(收齐|收上来|收回来|回款|到账了没|谁还没付|谁没付|催一下|催收|进度|还差谁|都付了吗|付了没有)/.test(text)
+    /(他们|大家|其他人|参与人|那几个人|别人|他俩|俩)/.test(text) &&
+      /(付|给|还|转).{0,4}(钱|款|了|没|吗)/.test(text)
+    || /(给了没|付了没|给了吗|付了吗|给了没有|付了没有|到账了没)/.test(text)
+    || /(收齐|收上来|收回来|回款|谁还没付|谁没付|催一下|催催|催一催|催收|进度|还差谁|都付了吗|付了没有)/.test(text)
     || (/AA|分摊|收款/.test(text) && /(进度|状态|怎么样|如何|付了|还了|收齐|明细)/.test(text));
 
   // ★ 记账意图:「帮我记一下」「这笔是借他的」「记成房租」
@@ -677,7 +702,7 @@ function parseIntent(text: string, now: number): Intent {
 
   /** 事件名词:客户生活里的关键事件 */
   const eventNoun =
-    /(纪念日|周年|结婚纪念|领证|生日|寿辰|过生|发薪日|发薪|发工资|开工资|工资到账|月薪到账|薪水到账|大额支出|大额开销|大笔支出|固定扣款|集中扣款|旅游|旅行|出游|出去玩|度假|出行|自驾)/.test(
+    /(纪念日|周年|结婚纪念|领证|生日|寿辰|过生|发薪日|发薪|发工资|开工资|工资到账|月薪到账|薪水到账|大额支出|大额开销|大笔支出|固定扣款|集中扣款|旅游|旅行|出游|出去玩|度假|出行|自驾|迪士尼|迪斯尼|游乐园|主题公园|欢乐谷|环球影城|门票)/.test(
       text,
     );
   /** 规划动作:出现它才说明客户要的是"方案",不是"一份查询结果" */
@@ -731,8 +756,22 @@ function parseIntent(text: string, now: number): Intent {
   const isEventPlan =
     (eventNoun && eventPlanVerb && !isEventList) ||
     (/(帮我规划|规划一下|安排一下|帮我安排)/.test(text) && !/(预算|理财|基金|产品|花多少|省钱|省点)/.test(text));
+  /**
+   * ★ 发薪分配清单(演示用,优先于跨场景联动):
+   *   「工资到账帮我理一下怎么花」要的是**账单+扣款+可点续办**,
+   *   不是纪念日/迪士尼那种多步联动方案。
+   */
+  const isPaydayBrief =
+    (/(工资|薪水|月薪|发薪)/.test(text) &&
+      /(到账|到了|刚进|刚发|发了|入账)/.test(text) &&
+      /(理|分配|安排|怎么花|划|该怎么|先用|剩下)/.test(text)) ||
+    /工资刚到账/.test(text) ||
+    /(帮我|给我).{0,8}(理一下|理一理).{0,16}(工资|钱|怎么分配|该怎么花|这个月)/.test(text) ||
+    (/(该怎么分配|怎么分配|分配一下)/.test(text) && /(工资|薪水|发薪|到账)/.test(text));
+
   const isEventIntent =
-    isEventPlan || isEventList || isEventRegister || isEventFundStep || isEventExternalStep;
+    !isPaydayBrief &&
+    (isEventPlan || isEventList || isEventRegister || isEventFundStep || isEventExternalStep);
 
   // 理财动作判定顺序(更具体的优先):
   //   ① 签确认书 —— 法律上的独立意思表示,必须单独接住
@@ -791,7 +830,8 @@ function parseIntent(text: string, now: number): Intent {
     ) && !/(理财|基金|申购|赎回|产品)/.test(text);
   const isQuery = /(余额|多少钱|流水|账单|消费|花了|明细|查询)/.test(text) && !/转(账|给)/.test(text);
   // 催收:在状态查询基础上再区分"催他们一下"
-  const isCollectionRemind = isCollectionStatus && /(催|提醒|催一下|催收|问他们要)/.test(text);
+  const isCollectionRemind =
+    isCollectionStatus && /(催|提醒|催一下|催催|催一催|催收|问他们要)/.test(text);
 
   /**
    * ★ 材料比对(账单分析之上的扩展能力,不占场景编号)。
@@ -887,6 +927,7 @@ function parseIntent(text: string, now: number): Intent {
   //   ④ 撤销已转出的钱 早于普通转账。
   if (isPolicyQuestion) action = "policy.search";
   else if (isMemoryQuestion) action = "memory.search";
+  else if (isPaydayBrief) action = "account.payday_brief";
   else if (isCardIntent) {
     // ★ 「为什么被限制」与「帮我解开」必须分开:
     //   前者只读(查原因),后者是"放宽敞口"方向(提交解除申请)。
@@ -1898,7 +1939,11 @@ export function extractPayee(text: string): Intent["payee"] | null {
   // ---- 情感/语境线索:「房东催租了」----
   // ★ 隐含意图:用户说"房东催租了",字面上没有"转账"两个字,
   //   但语境明确指向"该给房东付房租了"。识别出对象,金额留待澄清。
-  if (/(催|要|该给|该付|到期|欠|还差|别忘了给)/.test(text)) {
+  // ★ 排除 AA 催收/进度:「帮我催一下他们」里的「催」不是催租。
+  if (
+    !/(催一下|催催|催一催|催收|谁还没付|给了没|付了没|AA|分摊)/.test(text) &&
+    /(催|要|该给|该付|到期|欠|还差|别忘了给)/.test(text)
+  ) {
     const who = text.match(/^([\u4e00-\u9fa5]{2,4})/);
     if (who?.[1] && !/^(我|你|他|她|这个|那个)/.test(who[1])) {
       return { by: "alias", raw: who[1], alias: who[1] };
@@ -2156,6 +2201,8 @@ function buildRestatement(input: {
       return `用户想执行方案里的资金操作步骤(需确认):${input.text.slice(0, 40)}`;
     case "event.external_step":
       return `用户想执行方案里的外部服务操作步骤(需强验证):${input.text.slice(0, 40)}`;
+    case "account.payday_brief":
+      return "用户想在工资到账后看清固定支出与可自由支配金额(发薪分配清单,只读,不自动扣款)";
     default:
       return `用户请求:${input.text.slice(0, 60)}`;
   }
